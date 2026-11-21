@@ -1,0 +1,8 @@
+{
+  "name": "DocVerify QE — Migration Output Diff Workbench",
+  "description": "Configuration-driven QE validation and human-review workbench for IMDS/OpenText DCP to DDGS/SmartComm document outputs across AFP (Papyrus), PDF, PCL, and RT/RPT formats.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
