@@ -1,0 +1,11 @@
+CIBC ENTERPRISE OPERATIONS - DAILY CLEARING & RECONCILIATION (RPT-010)
+RUN DATE: 2026-11-20    INSTITUTION: 010    TRANSIT: 00012
+------------------------------------------------------------------------
+SEQ  TYPE       ACCT_TOKEN          STATUS      AMOUNT CAD
+001  PAD_IN     TOK-CIBC-1001       POSTED       $4,250.00
+002  EFT_CR     TOK-CIBC-1002       POSTED       $8,125.50
+003  WIRE_OUT   TOK-CIBC-1003       SETTLED      $2,400.00
+------------------------------------------------------------------------
+RECORD COUNT: 3
+GRAND TOTAL: $14,775.50
+END OF CIBC CONTROL REPORT

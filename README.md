@@ -192,3 +192,8 @@ When the server starts, `initializeSyntheticStore()` seeds **7 deterministic syn
 | `RUN-2026-1105` | `RT` | `BLOCKED` | Zero-byte candidate output demonstrating the **no-false-pass** policy |
 | `RUN-2026-1106` | `RT` | `CONFIRMED_DEFECT` | Wire Settlement report combining `TEXT_CHANGE`, `ALIGNMENT_SHIFT`, `MISSING_CONTENT`, `CONTROL_METADATA`, and aligned trailing footer |
 | `RUN-2026-1107` | `PDF` | `CONFIRMED_DEFECT` | **6-page Source vs. 7-page Destination** where Destination Page 3 is an inserted white/blank page; Slot 3 flags the missing source blank page while Slots 4–7 keep Source Pages 3–6 aligned to Destination Pages 4–7 |
+| `RUN-2026-1108` | `PDF` | `CONFIRMED_DEFECT` | **Real CIBC PAD Form** (`pre-auth-pay-national-en.pdf`, 1p vs. 1p) with NSF fee `TEXT_CHANGE`, `+20pt` `ALIGNMENT_SHIFT`, and font size drift |
+| `RUN-2026-1109` | `PDF` | `CONFIRMED_DEFECT` | **Real CIBC Form 12419 Personal Deposit Account Agreement** (6p vs. 7p) with an inserted blank Page 3 in Destination while aligning Source P3–P6 ↔ Dest P4–P7 and highlighting monthly fee drift |
+| `RUN-2026-1110` | `PDF` | `CONFIRMED_DEFECT` | **Real CIBC Bank USA Smart Account Disclosures** (`910126SAA`, 4p vs. 4p) with wire fee text & alignment drift |
+
+Additional ready-to-upload CIBC sample pairs (including **CIBC Mellon Direct Deposit PDF**, **CIBC AFP MO:DCA**, **CIBC PCL5**, and **CIBC RT/RPT**) are located in `samples/cibc/` and cataloged in [`samples/cibc/SAMPLES_INDEX.md`](samples/cibc/SAMPLES_INDEX.md). You can regenerate them anytime with `npx tsx scripts/build-cibc-samples.ts`.

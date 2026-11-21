@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { runComparisonEngine } from './adapters.ts';
 import type {
@@ -795,6 +797,55 @@ export async function initializeSyntheticStore(): Promise<Map<string, StoredRunR
     candidateFilename: 'DDGS_PORTFOLIO_STMT_20261120_007.pdf',
   });
   store.set(r7.run.id, r7);
+
+  // 8–10. Real Public CIBC Form Sample Pairs (when present in samples/cibc/)
+  const cibcDir = path.resolve(process.cwd(), 'samples/cibc');
+  const cibcSamples: Array<{
+    runId: string;
+    srcFile: string;
+    dstFile: string;
+    cfgIdx: number;
+    format: 'PDF' | 'AFP' | 'PCL' | 'RT';
+  }> = [
+    {
+      runId: 'RUN-2026-1108',
+      srcFile: 'IMDS_CIBC_PAD_FORM_SRC.pdf',
+      dstFile: 'DDGS_CIBC_PAD_FORM_DST_DEFECT.pdf',
+      cfgIdx: 0,
+      format: 'PDF',
+    },
+    {
+      runId: 'RUN-2026-1109',
+      srcFile: 'IMDS_CIBC_12419_ACCT_6P_SRC.pdf',
+      dstFile: 'DDGS_CIBC_12419_ACCT_7P_DST_BLANK_SHIFT.pdf',
+      cfgIdx: 0,
+      format: 'PDF',
+    },
+    {
+      runId: 'RUN-2026-1110',
+      srcFile: 'IMDS_CIBC_USA_SMART_4P_SRC.pdf',
+      dstFile: 'DDGS_CIBC_USA_SMART_4P_DST_DEFECT.pdf',
+      cfgIdx: 0,
+      format: 'PDF',
+    },
+  ];
+
+  for (const s of cibcSamples) {
+    const srcPath = path.join(cibcDir, s.srcFile);
+    const dstPath = path.join(cibcDir, s.dstFile);
+    if (fs.existsSync(srcPath) && fs.existsSync(dstPath)) {
+      const res = await runComparisonEngine({
+        runId: s.runId,
+        config: INVENTORY_CONFIGS[s.cfgIdx],
+        format: s.format,
+        baselineBuffer: fs.readFileSync(srcPath),
+        baselineFilename: s.srcFile,
+        candidateBuffer: fs.readFileSync(dstPath),
+        candidateFilename: s.dstFile,
+      });
+      store.set(res.run.id, res);
+    }
+  }
 
   return store;
 }

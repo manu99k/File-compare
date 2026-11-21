@@ -328,20 +328,30 @@ async function parsePdf(buf: Buffer, filename: string, wasCompressed: boolean): 
           text: redactedText,
         });
       }
-      let isBlank = lines.length === 0;
-      if (isBlank) {
+      const joinedText = lines.join(' ').trim();
+      let isBlank =
+        lines.length === 0 ||
+        /^(this\s+page\s+(is\s+)?intentionally\s+left\s+blank|intentionally\s+blank|blank\s+page)$/i.test(joinedText);
+      if (lines.length === 0) {
         try {
           const ops = await page.getOperatorList();
-          // Blank white PDF page has minimal graphics state ops (e.g. <= 6 ops and no image/text paint ops)
-          const hasImageOrPathPaint = ops.fnArray.some(
+          const hasRasterImage = ops.fnArray.some(
             (fn: number) =>
               fn === pdfjsLib.OPS.paintImageXObject ||
               fn === pdfjsLib.OPS.paintInlineImageXObject ||
-              fn === pdfjsLib.OPS.fill ||
-              fn === pdfjsLib.OPS.eoFill
+              fn === pdfjsLib.OPS.paintImageMaskXObject
           );
-          if (hasImageOrPathPaint && ops.fnArray.length > 10) {
+          const vectorPaintCount = ops.fnArray.filter(
+            (fn: number) =>
+              fn === pdfjsLib.OPS.constructPath ||
+              fn === pdfjsLib.OPS.fill ||
+              fn === pdfjsLib.OPS.eoFill ||
+              fn === pdfjsLib.OPS.stroke ||
+              fn === pdfjsLib.OPS.fillStroke
+          ).length;
+          if (hasRasterImage || vectorPaintCount >= 3) {
             isBlank = false;
+            parseNotes.push(`Page ${i}: Image/vector form content detected (0 extractable text lines); use Pixel Diff Canvas.`);
           }
         } catch {
           // keep lines.length === 0 fallback
@@ -1198,12 +1208,38 @@ function lineAnchorKey(line: string): string {
   return line.replace(/\s+/g, ' ').trim();
 }
 
+function lineWordTokens(line: string): string[] {
+  return line
+    .toLowerCase()
+    .replace(/\*\d{6,}\*/g, ' ')
+    .replace(/\bpage\s+\d+\s+(?:of|\/)\s+\d+\b/gi, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !/^\d{7,}$/.test(w));
+}
+
+function lineTokenDice(a: string, b: string): number {
+  const ta = lineWordTokens(a);
+  const tb = lineWordTokens(b);
+  if (ta.length === 0 && tb.length === 0) return a === b ? 1 : 0;
+  if (ta.length === 0 || tb.length === 0) return 0;
+  const setA = new Set(ta);
+  const setB = new Set(tb);
+  let inter = 0;
+  for (const t of setA) {
+    if (setB.has(t)) inter++;
+  }
+  return (2 * inter) / (setA.size + setB.size);
+}
+
 function alignPageLines(
   bLines: string[],
   cLines: string[]
 ): Array<{ bIdx: number | null; cIdx: number | null }> {
   const m = bLines.length;
   const n = cLines.length;
+  if (m === 0 && n === 0) return [];
   if (m * n > 60000) {
     const len = Math.max(m, n);
     return Array.from({ length: len }, (_, k) => ({
@@ -1214,72 +1250,91 @@ function alignPageLines(
 
   const bKeys = bLines.map(lineAnchorKey);
   const cKeys = cLines.map(lineAnchorKey);
+  const GAP_PEN = -0.55;
 
   const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-  for (let i = m - 1; i >= 0; i--) {
-    for (let j = n - 1; j >= 0; j--) {
-      dp[i][j] =
-        bKeys[i] === cKeys[j]
-          ? dp[i + 1][j + 1] + 1
-          : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    }
+  const bt: string[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(''));
+
+  for (let i = 1; i <= m; i++) {
+    dp[i][0] = dp[i - 1][0] + GAP_PEN;
+    bt[i][0] = 'U';
+  }
+  for (let j = 1; j <= n; j++) {
+    dp[0][j] = dp[0][j - 1] + GAP_PEN;
+    bt[0][j] = 'L';
   }
 
-  const anchors: Array<{ bi: number; ci: number }> = [];
-  let i = 0;
-  let j = 0;
-  while (i < m && j < n) {
-    if (bKeys[i] === cKeys[j]) {
-      anchors.push({ bi: i, ci: j });
-      i++;
-      j++;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-      i++;
-    } else {
-      j++;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      let score: number;
+      if (bKeys[i - 1] === cKeys[j - 1]) {
+        score = 2.0;
+      } else {
+        const dice = lineTokenDice(bKeys[i - 1], cKeys[j - 1]);
+        score = dice >= 0.55 ? 1.2 * dice : -0.9;
+      }
+      const diag = dp[i - 1][j - 1] + score;
+      const up = dp[i - 1][j] + GAP_PEN;
+      const left = dp[i][j - 1] + GAP_PEN;
+      if (diag >= up && diag >= left) {
+        dp[i][j] = diag;
+        bt[i][j] = 'D';
+      } else if (up >= left) {
+        dp[i][j] = up;
+        bt[i][j] = 'U';
+      } else {
+        dp[i][j] = left;
+        bt[i][j] = 'L';
+      }
     }
   }
-  anchors.push({ bi: m, ci: n });
 
   const pairs: Array<{ bIdx: number | null; cIdx: number | null }> = [];
-  let prevB = 0;
-  let prevC = 0;
-
-  for (const a of anchors) {
-    const bGap = a.bi - prevB;
-    const cGap = a.ci - prevC;
-    const commonGap = Math.min(bGap, cGap);
-    for (let k = 0; k < commonGap; k++) {
-      pairs.push({ bIdx: prevB + k, cIdx: prevC + k });
+  let i = m;
+  let j = n;
+  while (i > 0 || j > 0) {
+    const dir = bt[i][j];
+    if (dir === 'D') {
+      pairs.push({ bIdx: i - 1, cIdx: j - 1 });
+      i--;
+      j--;
+    } else if (dir === 'U') {
+      pairs.push({ bIdx: i - 1, cIdx: null });
+      i--;
+    } else {
+      pairs.push({ bIdx: null, cIdx: j - 1 });
+      j--;
     }
-    for (let k = commonGap; k < bGap; k++) {
-      pairs.push({ bIdx: prevB + k, cIdx: null });
-    }
-    for (let k = commonGap; k < cGap; k++) {
-      pairs.push({ bIdx: null, cIdx: prevC + k });
-    }
-    if (a.bi < m && a.ci < n) {
-      pairs.push({ bIdx: a.bi, cIdx: a.ci });
-    }
-    prevB = a.bi + 1;
-    prevC = a.ci + 1;
   }
-
+  pairs.reverse();
   return pairs;
 }
 
-function pageLineSimilarity(bLines: string[], cLines: string[]): number {
-  if (bLines.length === 0 && cLines.length === 0) return 1.0;
-  if (bLines.length === 0 || cLines.length === 0) return 0.0;
-  const bSet = new Set(bLines.map(lineAnchorKey).filter(Boolean));
-  const cSet = new Set(cLines.map(lineAnchorKey).filter(Boolean));
-  if (bSet.size === 0 && cSet.size === 0) return 1.0;
-  let inter = 0;
-  for (const item of bSet) {
-    if (cSet.has(item)) inter++;
+function pageTokenStats(bLines: string[], cLines: string[]): { sim: number; bCount: number; cCount: number } {
+  const bTokens = new Set<string>();
+  for (const l of bLines) {
+    for (const t of lineWordTokens(l)) bTokens.add(t);
   }
-  const union = new Set([...bSet, ...cSet]).size;
-  return union === 0 ? 1.0 : inter / union;
+  const cTokens = new Set<string>();
+  for (const l of cLines) {
+    for (const t of lineWordTokens(l)) cTokens.add(t);
+  }
+  if (bTokens.size === 0 && cTokens.size === 0) {
+    return { sim: bLines.length === 0 && cLines.length === 0 ? 1.0 : 0.5, bCount: 0, cCount: 0 };
+  }
+  if (bTokens.size === 0 || cTokens.size === 0) {
+    return { sim: 0.0, bCount: bTokens.size, cCount: cTokens.size };
+  }
+  let inter = 0;
+  for (const t of bTokens) {
+    if (cTokens.has(t)) inter++;
+  }
+  const dice = (2 * inter) / (bTokens.size + cTokens.size);
+  return { sim: dice, bCount: bTokens.size, cCount: cTokens.size };
+}
+
+function pageLineSimilarity(bLines: string[], cLines: string[]): number {
+  return pageTokenStats(bLines, cLines).sim;
 }
 
 function alignDocumentPages(
@@ -1333,8 +1388,8 @@ function alignDocumentPages(
   // Needleman-Wunsch page sequence alignment (handles inserted blank/white pages without cascading off-by-1)
   const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
   const bt: string[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(''));
-  const gapPenBase = (i: number) => (isBaseBlank(i) ? -0.08 : -0.28);
-  const gapPenCand = (j: number) => (isCandBlank(j) ? -0.08 : -0.28);
+  const gapPenBase = (i: number) => (isBaseBlank(i) ? -0.05 : -1.15);
+  const gapPenCand = (j: number) => (isCandBlank(j) ? -0.05 : -1.15);
 
   for (let i = 1; i <= m; i++) {
     dp[i][0] = dp[i - 1][0] + gapPenBase(i - 1);
@@ -1355,8 +1410,16 @@ function alignDocumentPages(
       } else if (bb !== cb) {
         pairScore = -5.0; // Never force-pair a white/blank page with a content page
       } else {
-        const sim = pageLineSimilarity(bPages[i - 1], cPages[j - 1]);
-        pairScore = sim >= 0.4 ? 0.5 + sim : -0.35;
+        const { sim, bCount, cCount } = pageTokenStats(bPages[i - 1], cPages[j - 1]);
+        if (bCount === 0 && cCount === 0) {
+          // Both are scanned/image-only pages with 0 text tokens -> align sequentially
+          pairScore = 0.35;
+        } else if (bCount < 6 || cCount < 6) {
+          // Hybrid or raster-heavy form page -> avoid spurious page skipping from sparse text
+          pairScore = 0.25 + sim * 0.75;
+        } else {
+          pairScore = sim >= 0.3 ? 0.55 + sim * 1.45 : -0.4;
+        }
       }
 
       const diag = dp[i - 1][j - 1] + pairScore;
@@ -1557,7 +1620,7 @@ function computePageTextDiffs(
           if (bl && cl) {
             const dx = Math.round((cl.x - bl.x) * 10) / 10;
             const dy = Math.round((cl.y - bl.y) * 10) / 10;
-            if (Math.abs(dx) > 1.5 || Math.abs(dy) > 1.5) {
+            if (Math.abs(dx) > 3.0 || Math.abs(dy) > 3.0) {
               positionDelta = `ΔX ${dx >= 0 ? '+' : ''}${dx}pt · ΔY ${dy >= 0 ? '+' : ''}${dy}pt`;
             }
             if (bl.fontName !== cl.fontName || Math.abs(bl.fontSize - cl.fontSize) > 0.3) {

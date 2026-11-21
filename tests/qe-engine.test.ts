@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import zlib from 'node:zlib';
 import { PDFDocument } from 'pdf-lib';
@@ -187,5 +189,209 @@ test('alignDocumentPages handles 6-vs-7 pages with inserted blank Page 3 and exp
   assert.ok(htmlReport.includes('No White / Blank Page in Source File'));
   assert.ok(htmlReport.includes('INSERTED WHITE / BLANK PAGE'));
 });
+
+test('CIBC real PDF forms and CIBC AFP/PCL/RT samples validate cleanly including 6-vs-7 blank page shift', async () => {
+  const store = await initializeSyntheticStore();
+
+  // RUN-2026-1108: Real CIBC PAD Form (1p vs 1p)
+  const cibcPad = store.get('RUN-2026-1108');
+  assert.ok(cibcPad);
+  assert.equal(cibcPad.run.overallOutcome, 'CONFIRMED_DEFECT');
+  assert.equal(cibcPad.run.alignedPages.length, 1);
+  const padPdfOut = await generateHighlightedPdfDiffReport(cibcPad);
+  assert.equal(padPdfOut.subarray(0, 5).toString('ascii'), '%PDF-');
+
+  // RUN-2026-1109: Real CIBC Form 12419 Personal Deposit Account Terms (6p vs 7p with blank Page 3)
+  const cibc12419 = store.get('RUN-2026-1109');
+  assert.ok(cibc12419);
+  assert.equal(cibc12419.run.baseline.pageCount, 6);
+  assert.equal(cibc12419.run.candidate.pageCount, 7);
+  assert.equal(cibc12419.run.alignedPages.length, 7);
+  assert.equal(cibc12419.run.alignedPages[2].status, 'INSERTED_IN_CANDIDATE');
+  assert.equal(cibc12419.run.alignedPages[2].candidateBlank, true);
+  assert.equal(cibc12419.run.alignedPages[3].baselinePageNum, 3);
+  assert.equal(cibc12419.run.alignedPages[3].candidatePageNum, 4);
+  assert.equal(cibc12419.run.alignedPages[5].baselinePageNum, 5);
+  assert.equal(cibc12419.run.alignedPages[5].candidatePageNum, 6);
+  assert.equal(cibc12419.run.alignedPages[5].status, 'DIFF_DETECTED');
+  const cibc12419Pdf = await generateHighlightedPdfDiffReport(cibc12419);
+  const loadedCibcReport = await PDFDocument.load(cibc12419Pdf);
+  assert.equal(loadedCibcReport.getPageCount(), 8);
+
+  // RUN-2026-1110: Real CIBC Bank USA Smart Account Disclosures (4p vs 4p)
+  const cibcUsa = store.get('RUN-2026-1110');
+  assert.ok(cibcUsa);
+  assert.equal(cibcUsa.run.overallOutcome, 'CONFIRMED_DEFECT');
+  assert.equal(cibcUsa.run.alignedPages.length, 4);
+
+  // CIBC Mellon + AFP + PCL + RT file-pair samples in samples/cibc/
+  const cibcDir = path.resolve(process.cwd(), 'samples/cibc');
+  const mellonRes = await runComparisonEngine({
+    runId: 'TEST-CIBC-MELLON',
+    config: INVENTORY_CONFIGS[0],
+    format: 'PDF',
+    baselineBuffer: fs.readFileSync(path.join(cibcDir, 'IMDS_CIBC_MELLON_DD_SRC.pdf')),
+    baselineFilename: 'IMDS_CIBC_MELLON_DD_SRC.pdf',
+    candidateBuffer: fs.readFileSync(path.join(cibcDir, 'DDGS_CIBC_MELLON_DD_DST_DEFECT.pdf')),
+    candidateFilename: 'DDGS_CIBC_MELLON_DD_DST_DEFECT.pdf',
+  });
+  assert.equal(mellonRes.run.overallOutcome, 'CONFIRMED_DEFECT');
+
+  const afpRes = await runComparisonEngine({
+    runId: 'TEST-CIBC-AFP',
+    config: INVENTORY_CONFIGS[3],
+    format: 'AFP',
+    baselineBuffer: fs.readFileSync(path.join(cibcDir, 'IMDS_CIBC_DDA_STMT.afp')),
+    baselineFilename: 'IMDS_CIBC_DDA_STMT.afp',
+    candidateBuffer: fs.readFileSync(path.join(cibcDir, 'DDGS_CIBC_DDA_STMT.afp')),
+    candidateFilename: 'DDGS_CIBC_DDA_STMT.afp',
+  });
+  assert.equal(afpRes.run.afpDetails?.validationMode, 'DIRECT_MODCA_NATIVE');
+  assert.ok(afpRes.run.findings.some((f) => f.category.includes('IMM')));
+
+  const pclRes = await runComparisonEngine({
+    runId: 'TEST-CIBC-PCL',
+    config: INVENTORY_CONFIGS[1],
+    format: 'PCL',
+    baselineBuffer: fs.readFileSync(path.join(cibcDir, 'IMDS_CIBC_MTG_ESCROW.pcl')),
+    baselineFilename: 'IMDS_CIBC_MTG_ESCROW.pcl',
+    candidateBuffer: fs.readFileSync(path.join(cibcDir, 'DDGS_CIBC_MTG_ESCROW.pcl')),
+    candidateFilename: 'DDGS_CIBC_MTG_ESCROW.pcl',
+  });
+  assert.equal(pclRes.run.overallOutcome, 'CONFIRMED_DEFECT');
+
+  const rtRes = await runComparisonEngine({
+    runId: 'TEST-CIBC-RT',
+    config: INVENTORY_CONFIGS[2],
+    format: 'RT',
+    baselineBuffer: fs.readFileSync(path.join(cibcDir, 'IMDS_CIBC_DAILY_RECON.rpt')),
+    baselineFilename: 'IMDS_CIBC_DAILY_RECON.rpt',
+    candidateBuffer: fs.readFileSync(path.join(cibcDir, 'DDGS_CIBC_DAILY_RECON.rpt')),
+    candidateFilename: 'DDGS_CIBC_DAILY_RECON.rpt',
+  });
+  assert.equal(rtRes.run.overallOutcome, 'CONFIRMED_DEFECT');
+  assert.ok(rtRes.run.textDiffs.some((d) => d.diffCategory === 'MISSING_CONTENT'));
+});
+
+test('image-scanned PDF pages are never misclassified as blank white pages', async () => {
+  const scanPath = path.resolve(process.cwd(), 'public/assets/aistudio/Scan_20261120_105615_0b84c2e5.pdf');
+  const scanBuf = fs.readFileSync(scanPath);
+  const res = await runComparisonEngine({
+    runId: 'TEST-SCAN-IMG',
+    config: INVENTORY_CONFIGS[0],
+    format: 'PDF',
+    baselineBuffer: scanBuf,
+    baselineFilename: 'Scan_20261120_105615_0b84c2e5.pdf',
+    candidateBuffer: scanBuf,
+    candidateFilename: 'Scan_20261120_105615_0b84c2e5.pdf',
+  });
+  assert.equal(res.run.baseline.pageCount, 8);
+  assert.equal(res.run.alignedPages.length, 8);
+  assert.equal(
+    res.run.alignedPages.filter((s) => s.baselineBlank).length,
+    0,
+    'Scanned raster pages must not be flagged as blank white pages'
+  );
+});
+
+test('6-vs-7 CIBC hybrid PDF with leading blank Page 1 and sparse/raster pages 4-5 stays aligned across all 7 slots', async () => {
+  const { StandardFonts, rgb } = await import('pdf-lib');
+
+  const makeDoc = async (isDest: boolean) => {
+    const doc = await PDFDocument.create();
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+
+    if (isDest) {
+      // Dest Page 1 is an inserted white/blank page
+      doc.addPage([612, 792]);
+    }
+
+    const addTextPage = (lines: string[]) => {
+      const p = doc.addPage([612, 792]);
+      lines.forEach((l, idx) => p.drawText(l, { x: 48, y: 730 - idx * 20, size: 10, font, color: rgb(0.1, 0.1, 0.1) }));
+    };
+
+    // Content Page 1 (Src P1, Dst P2) - plus DDGS mailroom barcode & small wrap difference
+    addTextPage([
+      ...(isDest ? ['*070202000000*'] : []),
+      'CIBC BUSINESS BANKING',
+      'Restricting Professional Trustee Designation to Accounts',
+      'Account Terms and Professional Trustee Rules Section 1',
+      'Authorized Signatory Verification and Compliance Details',
+    ]);
+
+    // Content Page 2 (Src P2, Dst P3)
+    addTextPage([
+      'Additional Terms and Conditions for Trustee Accounts',
+      'CDIC Disclosure Requirements and Reporting Obligations',
+      'Beneficiary Schedule and Notice Provisions',
+    ]);
+
+    // Content Page 3 (Src P3, Dst P4)
+    addTextPage([
+      'CIBC Trust Account Information Form (CDIC)',
+      'Account Information and Beneficiary Breakdown',
+      'Please return completed form to CIBC Branch Transit',
+    ]);
+
+    // Content Page 4 (Src P4, Dst P5) - hybrid/sparse signature page (raster/vector heavy in Dest)
+    const p4 = doc.addPage([612, 792]);
+    for (let k = 0; k < 12; k++) {
+      p4.drawRectangle({ x: 50, y: 300 + k * 10, width: 220, height: 4, color: rgb(0.95, 0.95, 0.95) });
+    }
+    if (!isDest) {
+      p4.drawText('Your Privacy - Account Holder Signature', { x: 48, y: 700, size: 10, font, color: rgb(0.1, 0.1, 0.1) });
+    }
+
+    // Content Page 5 (Src P5, Dst P6) - CDIC table page (sparse/vector heavy in Dest)
+    const p5 = doc.addPage([612, 792]);
+    for (let k = 0; k < 12; k++) {
+      p5.drawRectangle({ x: 50, y: 280 + k * 12, width: 280, height: 5, color: rgb(0.94, 0.94, 0.94) });
+    }
+    if (!isDest) {
+      p5.drawText('CIBC CDIC Professional Trustee Account Information', { x: 48, y: 720, size: 10, font, color: rgb(0.1, 0.1, 0.1) });
+      p5.drawText('Legal Name of Trustee | Account Number | Privacy', { x: 48, y: 690, size: 10, font, color: rgb(0.1, 0.1, 0.1) });
+    }
+
+    // Content Page 6 (Src P6, Dst P7) - Acknowledgment & Privacy + barcode in Dest
+    addTextPage([
+      ...(isDest ? ['*070707000000*'] : []),
+      'Acknowledgment of Responsibilities',
+      'Record Retention and Privacy Obligations',
+      'Signature of Authorized Signatory and Date',
+    ]);
+
+    return Buffer.from(await doc.save());
+  };
+
+  const srcBuf = await makeDoc(false);
+  const dstBuf = await makeDoc(true);
+  const res = await runComparisonEngine({
+    runId: 'TEST-CIBC-HYBRID-6V7',
+    config: INVENTORY_CONFIGS[0],
+    format: 'PDF',
+    baselineBuffer: srcBuf,
+    baselineFilename: 'IMDS_CIBC_TRUSTEE_6P.pdf',
+    candidateBuffer: dstBuf,
+    candidateFilename: 'DDGS_CIBC_TRUSTEE_7P.pdf',
+  });
+
+  assert.equal(res.run.baseline.pageCount, 6);
+  assert.equal(res.run.candidate.pageCount, 7);
+  assert.equal(
+    res.run.alignedPages.length,
+    7,
+    `Expected 7 aligned slots (not 8!), got: ${res.run.alignedPages.map((s) => `${s.baselinePageNum ?? '-'}<->${s.candidatePageNum ?? '-'}`).join(', ')}`
+  );
+  assert.equal(res.run.alignedPages[0].baselinePageNum, null);
+  assert.equal(res.run.alignedPages[0].candidatePageNum, 1);
+  assert.equal(res.run.alignedPages[0].status, 'INSERTED_IN_CANDIDATE');
+  for (let p = 1; p <= 6; p++) {
+    assert.equal(res.run.alignedPages[p].baselinePageNum, p);
+    assert.equal(res.run.alignedPages[p].candidatePageNum, p + 1);
+  }
+});
+
+
 
 
