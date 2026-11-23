@@ -14,19 +14,35 @@ import {
   initializeSyntheticStore,
   type StoredRunRecord,
 } from './server/fixtures.ts';
-import { validateInventoryConfig } from './server/security.ts';
+import { MAX_UPLOAD_FILE_BYTES, validateInventoryConfig } from './server/security.ts';
 import { generateHighlightedHtmlReport, generateHighlightedPdfDiffReport } from './server/reportExport.ts';
-import type { FileFormat, InventoryConfigRule, ReviewDecisionRecord } from './src/types/qe.ts';
+import type { ComparisonRun, FileFormat, InventoryConfigRule, ReviewDecisionRecord } from './src/types/qe.ts';
 
 const PORT = 3000;
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 },
+  limits: {
+    fileSize: MAX_UPLOAD_FILE_BYTES,
+    fieldSize: 10 * 1024 * 1024,
+  },
 });
+
+function summarizeRunForList(run: ComparisonRun): ComparisonRun {
+  return {
+    ...run,
+    isSummary: true,
+    alignedPages: [],
+    textDiffs: [],
+    pdfDetails: undefined,
+    pclDetails: undefined,
+    afpDetails: undefined,
+    rtDetails: undefined,
+  };
+}
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '10mb' }));
 
   const runsStore: Map<string, StoredRunRecord> = await initializeSyntheticStore();
   const configs: InventoryConfigRule[] = [...INVENTORY_CONFIGS];
@@ -48,7 +64,7 @@ async function startServer() {
 
   app.get('/api/runs', (_req, res) => {
     const list = Array.from(runsStore.values())
-      .map((r) => r.run)
+      .map((r) => summarizeRunForList(r.run))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     res.json({ runs: list });
   });
@@ -118,8 +134,11 @@ async function startServer() {
     }
 
     if (format === 'diff-pdf') {
-      if (run.format !== 'PDF' || !run.pdfVisualReady) {
-        res.status(400).json({ error: 'Annotated PDF diff export is only supported for valid PDF comparison runs.' });
+      const canExportPdf =
+        (run.format === 'PDF' && run.pdfVisualReady) ||
+        (run.format === 'AFP' && run.baseline.parseStatus === 'PARSED' && run.candidate.parseStatus === 'PARSED');
+      if (!canExportPdf) {
+        res.status(400).json({ error: 'Annotated PDF diff export is supported for parsed PDF and AFP comparison runs.' });
         return;
       }
       try {
@@ -310,6 +329,7 @@ async function startServer() {
       });
 
       rec.run.afpDetails = {
+        ...rec.run.afpDetails,
         validationMode: rec.run.afpDetails?.validationMode || 'DIRECT_MODCA_NATIVE',
         encodingDetected: rec.run.afpDetails?.encodingDetected || 'MO:DCA Binary',
         baselineFields: rec.run.afpDetails?.baselineFields || [],
@@ -409,6 +429,27 @@ async function startServer() {
     res.json(DESIGN_PACK);
   });
 
+  app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        const maxMb = Math.round(MAX_UPLOAD_FILE_BYTES / (1024 * 1024));
+        res.status(413).json({
+          error: `Uploaded file exceeds the ${maxMb} MB per-file limit.`,
+        });
+        return;
+      }
+      res.status(400).json({ error: `Upload error (${err.code}): ${err.message}` });
+      return;
+    }
+    if (err && req.path.startsWith('/api/')) {
+      const status = typeof (err as { status?: number }).status === 'number' ? (err as { status: number }).status : 500;
+      const message = err instanceof Error ? err.message : 'Internal API error';
+      res.status(status).json({ error: message });
+      return;
+    }
+    next(err);
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -423,9 +464,12 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`DocVerify QE server listening on http://0.0.0.0:${PORT}`);
   });
+  server.requestTimeout = 600_000;
+  server.headersTimeout = 605_000;
+  server.keepAliveTimeout = 65_000;
 }
 
 startServer().catch((err) => {

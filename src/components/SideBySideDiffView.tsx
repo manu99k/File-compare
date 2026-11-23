@@ -1,7 +1,9 @@
-import { useMemo, useState } from 'react';
-import { Columns2, Eye, Filter } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { ChevronLeft, ChevronRight, Columns2, Eye, Filter } from 'lucide-react';
 import type { ComparisonRun, DiffCategory, InlineToken, TextDiffLine } from '../types/qe';
 import { DIFF_CATEGORY_ORDER, DIFF_COLOR_MAP } from '../lib/diffColors';
+
+const ROWS_PER_PAGE = 200;
 
 interface SideBySideDiffViewProps {
   run: ComparisonRun;
@@ -63,6 +65,11 @@ export function SideBySideDiffView({ run, onJumpToVisualPage }: SideBySideDiffVi
   const [viewMode, setViewMode] = useState<'all' | 'changes'>('all');
   const [selectedCategory, setSelectedCategory] = useState<DiffCategory | 'ALL'>('ALL');
   const [showWhitespace, setShowWhitespace] = useState(run.format === 'RT');
+  const [rowPage, setRowPage] = useState(0);
+
+  useEffect(() => {
+    setRowPage(0);
+  }, [run.id, viewMode, selectedCategory]);
 
   const categoryCounts = useMemo(() => {
     const counts: Record<DiffCategory, number> = {
@@ -84,8 +91,8 @@ export function SideBySideDiffView({ run, onJumpToVisualPage }: SideBySideDiffVi
   }, [run.textDiffs]);
 
   const totalDiffLines = useMemo(
-    () => run.textDiffs.filter((d) => d.diffCategory !== 'EQUAL').length,
-    [run.textDiffs]
+    () => run.totalDiffCount ?? run.textDiffs.filter((d) => d.diffCategory !== 'EQUAL').length,
+    [run.totalDiffCount, run.textDiffs]
   );
 
   const visibleRows = useMemo(() => {
@@ -102,6 +109,13 @@ export function SideBySideDiffView({ run, onJumpToVisualPage }: SideBySideDiffVi
       return true;
     });
   }, [run.textDiffs, selectedCategory, viewMode]);
+
+  const totalRowPages = Math.max(1, Math.ceil(visibleRows.length / ROWS_PER_PAGE));
+  const safeRowPage = Math.min(rowPage, totalRowPages - 1);
+  const pagedRows = useMemo(() => {
+    const start = safeRowPage * ROWS_PER_PAGE;
+    return visibleRows.slice(start, start + ROWS_PER_PAGE);
+  }, [visibleRows, safeRowPage]);
 
   const eolDrift =
     run.baseline.lineEnding !== run.candidate.lineEnding ||
@@ -269,6 +283,45 @@ export function SideBySideDiffView({ run, onJumpToVisualPage }: SideBySideDiffVi
         </div>
       )}
 
+      {run.diffLinesTruncated && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900">
+          Large-file view: 100% of detected variances ({totalDiffLines.toLocaleString()} diff lines) are preserved; matched context lines were sampled to keep the browser table responsive.
+        </div>
+      )}
+
+      {visibleRows.length > ROWS_PER_PAGE && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-xs">
+          <span className="font-mono text-slate-600 tabular-nums">
+            Showing lines {(safeRowPage * ROWS_PER_PAGE + 1).toLocaleString()}–
+            {Math.min((safeRowPage + 1) * ROWS_PER_PAGE, visibleRows.length).toLocaleString()} of{' '}
+            {visibleRows.length.toLocaleString()}
+          </span>
+          <div className="inline-flex items-center gap-1.5">
+            <button
+              type="button"
+              disabled={safeRowPage === 0}
+              onClick={() => setRowPage((p) => Math.max(0, p - 1))}
+              className="inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+              Prev
+            </button>
+            <span className="font-mono px-2 text-slate-700 tabular-nums">
+              Page {safeRowPage + 1} / {totalRowPages}
+            </span>
+            <button
+              type="button"
+              disabled={safeRowPage >= totalRowPages - 1}
+              onClick={() => setRowPage((p) => Math.min(totalRowPages - 1, p + 1))}
+              className="inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+            >
+              Next
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Synchronized Two-Column Side-by-Side Comparison */}
       <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
         {visibleRows.length === 0 ? (
@@ -317,7 +370,7 @@ export function SideBySideDiffView({ run, onJumpToVisualPage }: SideBySideDiffVi
               </thead>
 
               <tbody className="divide-y divide-slate-200/80">
-                {visibleRows.map((row: TextDiffLine) => {
+                {pagedRows.map((row: TextDiffLine) => {
                   const meta = DIFF_COLOR_MAP[row.diffCategory];
                   const pageMatch = row.pageOrSection.match(/^Page\s+(\d+)/i);
                   const pageNum = pageMatch ? Number(pageMatch[1]) : null;

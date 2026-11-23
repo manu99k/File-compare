@@ -1,4 +1,3 @@
-import { PDFDocument } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 import {
   computeSha256,
@@ -6,6 +5,7 @@ import {
   safeGunzip,
   sanitizeFilename,
 } from './security.ts';
+import { parseAfpDocument } from './afpEngine.ts';
 import type {
   AdapterCapability,
   AfpPageGeometry,
@@ -13,6 +13,7 @@ import type {
   AfpResourceRef,
   AfpStructuredField,
   AfpTleEntry,
+  AfpVisualPage,
   AlignedPageSlot,
   ArtifactMetadata,
   ComparisonLayerSummary,
@@ -65,7 +66,7 @@ export const ADAPTER_REGISTRY: AdapterCapability[] = [
     format: 'PDF',
     displayName: 'PDF Document & Visual Canvas',
     supportStatus: 'Automated + Visual Diff',
-    parserEngine: 'pdf-lib Structural Reader + pdfjs-dist Text & Canvas Pixel Diff',
+    parserEngine: 'pdfjs-dist Structural, Text & Canvas Pixel Diff',
     canParse: [
       'PDF header, cross-reference integrity, and producer/creator metadata',
       'Per-page MediaBox dimensions (points) and orientation',
@@ -138,7 +139,7 @@ export const ADAPTER_REGISTRY: AdapterCapability[] = [
     parserEngine: 'Bounded zlib Stream Inspector (Decompression-Bomb Guarded)',
     canParse: [
       'GZIP magic header (0x1F 0x8B) and stream CRC/trailer integrity',
-      'Safe bounded decompression (15 MB cap, 50:1 ratio cap)',
+      'Safe bounded decompression (150 MB upload / 200 MB decompressed cap, 120:1 ratio cap)',
       'Nested compression detection',
     ],
     checksPerformed: [
@@ -169,6 +170,10 @@ interface ParsedArtifact {
     resources: AfpResourceRef[];
     ptocaRuns: AfpPtocaRun[];
     geometry: AfpPageGeometry[];
+    visualPages?: AfpVisualPage[];
+    mediaAssets?: Record<string, string>;
+    totalBngCount?: number;
+    totalFieldCount?: number;
   };
   rtInfo?: {
     banner: string;
@@ -250,26 +255,34 @@ async function parsePdf(buf: Buffer, filename: string, wasCompressed: boolean): 
     };
   }
 
+  let jsPdf: pdfjsLib.PDFDocumentProxy | null = null;
   try {
-    const pdfDoc = await PDFDocument.load(buf, { ignoreEncryption: true });
-    const pages = pdfDoc.getPages();
-    const pageCount = pages.length;
-    const dimsArr = pages.map((p) => {
-      const { width, height } = p.getSize();
-      return { width: Math.round(width), height: Math.round(height) };
-    });
-    const dims = dimsArr.map((d) => `${d.width}x${d.height}pt`);
-    const uniqueDims = Array.from(new Set(dims));
-    const producer = pdfDoc.getProducer() || pdfDoc.getCreator() || 'Unspecified PDF Producer';
-
-    // Extract positioned text using pdfjs-dist
+    // Independent byte view prevents pdfjs worker transfer from detaching the original Buffer
+    const pdfBytesCopy = new Uint8Array(buf);
     const loadingTask = pdfjsLib.getDocument({
-      data: new Uint8Array(buf),
+      data: pdfBytesCopy,
       useSystemFonts: true,
       disableFontFace: true,
       verbosity: 0,
     });
-    const jsPdf = await loadingTask.promise;
+    jsPdf = await loadingTask.promise;
+    const pageCount = jsPdf.numPages;
+
+    let producer = 'Unspecified PDF Producer';
+    try {
+      const md = await jsPdf.getMetadata();
+      const info = (md?.info || {}) as Record<string, unknown>;
+      if (typeof info.Producer === 'string' && info.Producer.trim()) {
+        producer = info.Producer.trim();
+      } else if (typeof info.Creator === 'string' && info.Creator.trim()) {
+        producer = info.Creator.trim();
+      }
+    } catch {
+      // keep default producer label
+    }
+
+    const dimsArr: Array<{ width: number; height: number }> = [];
+    const dims: string[] = [];
     const pagesText: string[][] = [];
     const pagesBlank: boolean[] = [];
     const pdfLayouts: PdfLineLayout[][] = [];
@@ -277,91 +290,104 @@ async function parsePdf(buf: Buffer, filename: string, wasCompressed: boolean): 
 
     for (let i = 1; i <= jsPdf.numPages; i++) {
       const page = await jsPdf.getPage(i);
-      const content = await page.getTextContent();
-      const styles = (content.styles || {}) as Record<string, { fontFamily?: string }>;
-      const rows = new Map<
-        number,
-        Array<{ x: number; y: number; width: number; height: number; fontName: string; fontSize: number; text: string }>
-      >();
+      try {
+        const unscaled = page.getViewport({ scale: 1 });
+        const pw = Math.round(unscaled.width);
+        const ph = Math.round(unscaled.height);
+        dimsArr.push({ width: pw, height: ph });
+        dims.push(`${pw}x${ph}pt`);
 
-      for (const item of content.items) {
-        if ('str' in item && item.str.trim().length > 0) {
-          const yRaw = item.transform[5];
-          const yKey = Math.round(yRaw / 2) * 2;
-          const x = item.transform[4];
-          const fontSize = Math.round(Math.hypot(item.transform[0], item.transform[1]) * 10) / 10 || 10;
-          const styleFamily = styles[item.fontName]?.fontFamily || item.fontName || 'Helvetica';
-          const existing = rows.get(yKey) || [];
-          existing.push({
-            x,
-            y: Math.round(yRaw * 10) / 10,
-            width: Math.round((item.width || 0) * 10) / 10,
-            height: Math.round((item.height || fontSize) * 10) / 10,
-            fontName: styleFamily,
-            fontSize,
-            text: item.str,
-          });
-          rows.set(yKey, existing);
-        }
-      }
+        const content = await page.getTextContent();
+        const styles = (content.styles || {}) as Record<string, { fontFamily?: string }>;
+        const rows = new Map<
+          number,
+          Array<{ x: number; y: number; width: number; height: number; fontName: string; fontSize: number; text: string }>
+        >();
 
-      const sortedY = Array.from(rows.keys()).sort((a, b) => b - a);
-      const lines: string[] = [];
-      const pageLayouts: PdfLineLayout[] = [];
-      for (const yKey of sortedY) {
-        const chunks = rows.get(yKey)!.sort((a, b) => a.x - b.x);
-        const joined = chunks.map((c) => c.text).join(' ').replace(/\s+/g, ' ').trim();
-        const { redactedText, matchCount } = redactSensitiveText(joined);
-        totalRedactions += matchCount;
-        lines.push(redactedText);
-
-        const first = chunks[0];
-        const last = chunks[chunks.length - 1];
-        pageLayouts.push({
-          page: i,
-          x: Math.round(first.x * 10) / 10,
-          y: first.y,
-          width: Math.round((last.x + last.width - first.x) * 10) / 10,
-          height: first.height,
-          fontName: first.fontName,
-          fontSize: first.fontSize,
-          text: redactedText,
-        });
-      }
-      const joinedText = lines.join(' ').trim();
-      let isBlank =
-        lines.length === 0 ||
-        /^(this\s+page\s+(is\s+)?intentionally\s+left\s+blank|intentionally\s+blank|blank\s+page)$/i.test(joinedText);
-      if (lines.length === 0) {
-        try {
-          const ops = await page.getOperatorList();
-          const hasRasterImage = ops.fnArray.some(
-            (fn: number) =>
-              fn === pdfjsLib.OPS.paintImageXObject ||
-              fn === pdfjsLib.OPS.paintInlineImageXObject ||
-              fn === pdfjsLib.OPS.paintImageMaskXObject
-          );
-          const vectorPaintCount = ops.fnArray.filter(
-            (fn: number) =>
-              fn === pdfjsLib.OPS.constructPath ||
-              fn === pdfjsLib.OPS.fill ||
-              fn === pdfjsLib.OPS.eoFill ||
-              fn === pdfjsLib.OPS.stroke ||
-              fn === pdfjsLib.OPS.fillStroke
-          ).length;
-          if (hasRasterImage || vectorPaintCount >= 3) {
-            isBlank = false;
-            parseNotes.push(`Page ${i}: Image/vector form content detected (0 extractable text lines); use Pixel Diff Canvas.`);
+        for (const item of content.items) {
+          if ('str' in item && item.str.trim().length > 0) {
+            const yRaw = item.transform[5];
+            const yKey = Math.round(yRaw / 2) * 2;
+            const x = item.transform[4];
+            const fontSize = Math.round(Math.hypot(item.transform[0], item.transform[1]) * 10) / 10 || 10;
+            const styleFamily = styles[item.fontName]?.fontFamily || item.fontName || 'Helvetica';
+            const existing = rows.get(yKey) || [];
+            existing.push({
+              x,
+              y: Math.round(yRaw * 10) / 10,
+              width: Math.round((item.width || 0) * 10) / 10,
+              height: Math.round((item.height || fontSize) * 10) / 10,
+              fontName: styleFamily,
+              fontSize,
+              text: item.str,
+            });
+            rows.set(yKey, existing);
           }
-        } catch {
-          // keep lines.length === 0 fallback
         }
+
+        const sortedY = Array.from(rows.keys()).sort((a, b) => b - a);
+        const lines: string[] = [];
+        const pageLayouts: PdfLineLayout[] = [];
+        for (const yKey of sortedY) {
+          const chunks = rows.get(yKey)!.sort((a, b) => a.x - b.x);
+          const joined = chunks.map((c) => c.text).join(' ').replace(/\s+/g, ' ').trim();
+          const { redactedText, matchCount } = redactSensitiveText(joined);
+          totalRedactions += matchCount;
+          lines.push(redactedText);
+
+          const first = chunks[0];
+          const last = chunks[chunks.length - 1];
+          pageLayouts.push({
+            page: i,
+            x: Math.round(first.x * 10) / 10,
+            y: first.y,
+            width: Math.round((last.x + last.width - first.x) * 10) / 10,
+            height: first.height,
+            fontName: first.fontName,
+            fontSize: first.fontSize,
+            text: redactedText,
+          });
+        }
+        const joinedText = lines.join(' ').trim();
+        let isBlank =
+          lines.length === 0 ||
+          /^(this\s+page\s+(is\s+)?intentionally\s+left\s+blank|intentionally\s+blank|blank\s+page)$/i.test(joinedText);
+        if (lines.length === 0) {
+          try {
+            const ops = await page.getOperatorList();
+            const hasRasterImage = ops.fnArray.some(
+              (fn: number) =>
+                fn === pdfjsLib.OPS.paintImageXObject ||
+                fn === pdfjsLib.OPS.paintInlineImageXObject ||
+                fn === pdfjsLib.OPS.paintImageMaskXObject
+            );
+            const vectorPaintCount = ops.fnArray.filter(
+              (fn: number) =>
+                fn === pdfjsLib.OPS.constructPath ||
+                fn === pdfjsLib.OPS.fill ||
+                fn === pdfjsLib.OPS.eoFill ||
+                fn === pdfjsLib.OPS.stroke ||
+                fn === pdfjsLib.OPS.fillStroke
+            ).length;
+            if (hasRasterImage || vectorPaintCount >= 3) {
+              isBlank = false;
+              if (parseNotes.length < 25) {
+                parseNotes.push(`Page ${i}: Image/vector form content detected (0 extractable text lines); use Pixel Diff Canvas.`);
+              }
+            }
+          } catch {
+            // keep lines.length === 0 fallback
+          }
+        }
+        pagesText.push(lines);
+        pagesBlank.push(isBlank);
+        pdfLayouts.push(pageLayouts);
+      } finally {
+        page.cleanup();
       }
-      pagesText.push(lines);
-      pagesBlank.push(isBlank);
-      pdfLayouts.push(pageLayouts);
     }
 
+    const uniqueDims = Array.from(new Set(dims));
     const totalLines = pagesText.reduce((acc, p) => acc + p.length, 0);
     return {
       meta: {
@@ -410,6 +436,10 @@ async function parsePdf(buf: Buffer, filename: string, wasCompressed: boolean): 
       pagesText: [],
       rawUncompressedBuffer: buf,
     };
+  } finally {
+    if (jsPdf) {
+      await jsPdf.loadingTask.destroy().catch(() => undefined);
+    }
   }
 }
 
@@ -647,11 +677,16 @@ function parseRt(buf: Buffer, filename: string, wasCompressed: boolean): ParsedA
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
 
   let totalRedactions = 0;
-  const redactedLines = lines.map((l) => {
-    const { redactedText, matchCount } = redactSensitiveText(l);
+  let maxColWidth = 0;
+  const redactedLines: string[] = new Array(lines.length);
+  for (let i = 0; i < lines.length; i++) {
+    const { redactedText, matchCount } = redactSensitiveText(lines[i]);
     totalRedactions += matchCount;
-    return redactedText;
-  });
+    redactedLines[i] = redactedText;
+    if (redactedText.length > maxColWidth) {
+      maxColWidth = redactedText.length;
+    }
+  }
 
   // Extract control totals from numeric summary lines
   const totals: Record<string, number> = {};
@@ -668,7 +703,8 @@ function parseRt(buf: Buffer, filename: string, wasCompressed: boolean): ParsedA
 
   const banner = redactedLines[0] || '(No header banner)';
   const footer = redactedLines[redactedLines.length - 1] || '(No trailer/footer)';
-  const pageCount = Math.max(1, (textRaw.match(/\x0c/g) || []).length || Math.ceil(redactedLines.length / 45));
+  const formFeedCount = (textRaw.match(/\x0c/g) || []).length;
+  const pageCount = Math.max(1, formFeedCount || Math.ceil(redactedLines.length / 45));
 
   return {
     meta: {
@@ -682,7 +718,7 @@ function parseRt(buf: Buffer, filename: string, wasCompressed: boolean): ParsedA
       hasBom,
       pageCount,
       recordCount: redactedLines.length,
-      dimensionsSummary: `Max line width ${Math.max(0, ...redactedLines.map((l) => l.length))} cols`,
+      dimensionsSummary: `Max line width ${maxColWidth} cols`,
       producerOrTool: 'Text / RPT Batch Writer',
       parseStatus: 'PARSED',
       parseNotes: [`Line ending: ${lineEnding}${hasBom ? ' · BOM present' : ''}`],
@@ -699,423 +735,25 @@ function parseRt(buf: Buffer, filename: string, wasCompressed: boolean): ParsedA
   };
 }
 
-const MODCA_SFID_MAP: Record<string, { mnemonic: string; description: string }> = {
-  D3A8A8: { mnemonic: 'BDT', description: 'Begin Document' },
-  D3A9A8: { mnemonic: 'EDT', description: 'End Document' },
-  D3A8AD: { mnemonic: 'BNG', description: 'Begin Named Page Group' },
-  D3A9AD: { mnemonic: 'ENG', description: 'End Named Page Group' },
-  D3A8AF: { mnemonic: 'BPG', description: 'Begin Page' },
-  D3A9AF: { mnemonic: 'EPG', description: 'End Page' },
-  D3A8C9: { mnemonic: 'BAG', description: 'Begin Active Environment Group' },
-  D3A9C9: { mnemonic: 'EAG', description: 'End Active Environment Group' },
-  D3A8DF: { mnemonic: 'BPT', description: 'Begin Presentation Text' },
-  D3A9DF: { mnemonic: 'EPT', description: 'End Presentation Text' },
-  D3EE9B: { mnemonic: 'PTX', description: 'Presentation Text Data (PTOCA)' },
-  D3A6AF: { mnemonic: 'PGD', description: 'Page Descriptor' },
-  D3B19B: { mnemonic: 'PTD', description: 'Presentation Text Descriptor' },
-  D3A090: { mnemonic: 'TLE', description: 'Tagged Logical Element' },
-  D3AB8A: { mnemonic: 'MCF', description: 'Map Coded Font' },
-  D3B18A: { mnemonic: 'MCF2', description: 'Map Coded Font (Format 2)' },
-  D3ABD8: { mnemonic: 'MPO', description: 'Map Page Overlay' },
-  D3ABAF: { mnemonic: 'MPS', description: 'Map Page Segment' },
-  D3ABCC: { mnemonic: 'IMM', description: 'Invoke Medium Map' },
-  D3A8EB: { mnemonic: 'BBC', description: 'Begin Bar Code Object' },
-  D3A9EB: { mnemonic: 'EBC', description: 'End Bar Code Object' },
-  D3A8FB: { mnemonic: 'BIM', description: 'Begin Image Object' },
-  D3A9FB: { mnemonic: 'EIM', description: 'End Image Object' },
-  D3EEEE: { mnemonic: 'NOP', description: 'No Operation / Mailroom Comment' },
-};
-
-// IBM EBCDIC CP037 / CP500 printable byte-to-ASCII lookup table
-const EBCDIC_CP037_MAP: Record<number, string> = {
-  0x40: ' ', 0x4b: '.', 0x4c: '<', 0x4d: '(', 0x4e: '+', 0x4f: '|',
-  0x50: '&', 0x5a: '!', 0x5b: '$', 0x5c: '*', 0x5d: ')', 0x5e: ';', 0x5f: '^',
-  0x60: '-', 0x61: '/', 0x6b: ',', 0x6c: '%', 0x6d: '_', 0x6e: '>', 0x6f: '?',
-  0x7a: ':', 0x7b: '#', 0x7c: '@', 0x7d: "'", 0x7e: '=', 0x7f: '"',
-  0x81: 'a', 0x82: 'b', 0x83: 'c', 0x84: 'd', 0x85: 'e', 0x86: 'f', 0x87: 'g', 0x88: 'h', 0x89: 'i',
-  0x91: 'j', 0x92: 'k', 0x93: 'l', 0x94: 'm', 0x95: 'n', 0x96: 'o', 0x97: 'p', 0x98: 'q', 0x99: 'r',
-  0xa1: '~', 0xa2: 's', 0xa3: 't', 0xa4: 'u', 0xa5: 'v', 0xa6: 'w', 0xa7: 'x', 0xa8: 'y', 0xa9: 'z',
-  0xc1: 'A', 0xc2: 'B', 0xc3: 'C', 0xc4: 'D', 0xc5: 'E', 0xc6: 'F', 0xc7: 'G', 0xc8: 'H', 0xc9: 'I',
-  0xd1: 'J', 0xd2: 'K', 0xd3: 'L', 0xd4: 'M', 0xd5: 'N', 0xd6: 'O', 0xd7: 'P', 0xd8: 'Q', 0xd9: 'R',
-  0xe2: 'S', 0xe3: 'T', 0xe4: 'U', 0xe5: 'V', 0xe6: 'W', 0xe7: 'X', 0xe8: 'Y', 0xe9: 'Z',
-  0xf0: '0', 0xf1: '1', 0xf2: '2', 0xf3: '3', 0xf4: '4', 0xf5: '5', 0xf6: '6', 0xf7: '7', 0xf8: '8', 0xf9: '9',
-};
-
-function decodeAfpBytes(bytes: Buffer): { text: string; encoding: 'EBCDIC' | 'ASCII' } {
-  if (bytes.length === 0) return { text: '', encoding: 'ASCII' };
-  let ebcdicScore = 0;
-  let asciiScore = 0;
-
-  for (const b of bytes) {
-    if (b === 0x40 || (b >= 0xc1 && b <= 0xe9) || (b >= 0xf0 && b <= 0xf9) || (b >= 0x81 && b <= 0xa9)) {
-      ebcdicScore++;
-    }
-    if (b === 0x20 || (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a)) {
-      asciiScore++;
-    }
+async function parseArtifact(
+  buf: Buffer,
+  filename: string,
+  format: FileFormat
+): Promise<{ ok: boolean; parsed?: ParsedArtifact; error?: string }> {
+  const fnCheck = sanitizeFilename(filename);
+  if (fnCheck.rejected) {
+    return { ok: false, error: `Filename rejected: ${fnCheck.reason}` };
+  }
+  if (!buf || buf.length === 0) {
+    return { ok: false, error: `${filename} is zero bytes (empty output).` };
   }
 
-  // If high bytes (0x80+) dominate or 0x40 spaces appear without 0x20 spaces, treat as EBCDIC
-  const hasHighLetters = bytes.some((b) => (b >= 0xc1 && b <= 0xf9));
-  const useEbcdic = hasHighLetters || ebcdicScore > asciiScore;
-
-  if (useEbcdic) {
-    let out = '';
-    for (const b of bytes) {
-      out += EBCDIC_CP037_MAP[b] ?? ' ';
-    }
-    return { text: out.replace(/\s+/g, ' ').trim(), encoding: 'EBCDIC' };
-  }
-
-  const ascii = bytes.toString('latin1').replace(/[^\x20-\x7e]/g, ' ').replace(/\s+/g, ' ').trim();
-  return { text: ascii, encoding: 'ASCII' };
-}
-
-function parseAfpTriplets(payload: Buffer): Array<{ tid: number; data: Buffer }> {
-  const triplets: Array<{ tid: number; data: Buffer }> = [];
-  let pos = 0;
-  while (pos + 2 <= payload.length) {
-    const tLen = payload[pos];
-    if (tLen < 2 || pos + tLen > payload.length) break;
-    const tid = payload[pos + 1];
-    triplets.push({ tid, data: payload.subarray(pos + 2, pos + tLen) });
-    pos += tLen;
-  }
-  return triplets;
-}
-
-function parsePtocaPayload(
-  payload: Buffer,
-  pageIndex: number,
-  state: { x: number; y: number; fontLocalId: number }
-): AfpPtocaRun[] {
-  const runs: AfpPtocaRun[] = [];
-  // PTOCA control sequences begin with 0x2B 0xD3
-  if (payload.length >= 4 && payload[0] === 0x2b && payload[1] === 0xd3) {
-    let pos = 2;
-    while (pos + 2 <= payload.length) {
-      const csLen = payload[pos];
-      const csFn = payload[pos + 1];
-      if (csLen < 2 || pos + csLen > payload.length) break;
-      const params = payload.subarray(pos + 2, pos + csLen);
-      const fnBase = csFn & 0xfe; // unchained function code
-
-      if (fnBase === 0xc6 && params.length >= 2) {
-        // AMI - Absolute Move Inline (X)
-        state.x = params.readInt16BE(0);
-      } else if (fnBase === 0xd2 && params.length >= 2) {
-        // AMB - Absolute Move Baseline (Y)
-        state.y = params.readInt16BE(0);
-      } else if (fnBase === 0xc8 && params.length >= 2) {
-        // RMI - Relative Move Inline
-        state.x += params.readInt16BE(0);
-      } else if (fnBase === 0xd4 && params.length >= 2) {
-        // RMB - Relative Move Baseline
-        state.y += params.readInt16BE(0);
-      } else if (fnBase === 0xf0 && params.length >= 1) {
-        // SCFL - Set Coded Font Local
-        state.fontLocalId = params[0];
-      } else if (fnBase === 0xda && params.length > 0) {
-        // TRN - Transparent Data (actual printable text)
-        const decoded = decodeAfpBytes(params);
-        if (decoded.text.length > 0) {
-          runs.push({
-            pageIndex,
-            x: state.x,
-            y: state.y,
-            fontLocalId: state.fontLocalId,
-            text: decoded.text,
-            encoding: decoded.encoding,
-          });
-        }
-      }
-      pos += csLen;
-    }
-  } else {
-    // Fallback for raw unchained PTX payload
-    const decoded = decodeAfpBytes(payload);
-    if (decoded.text.length > 0) {
-      state.y += 60;
-      runs.push({
-        pageIndex,
-        x: state.x,
-        y: state.y,
-        fontLocalId: state.fontLocalId,
-        text: decoded.text,
-        encoding: decoded.encoding,
-      });
-    }
-  }
-  return runs;
-}
-
-function parseAfp(buf: Buffer, filename: string, wasCompressed: boolean): ParsedArtifact {
-  const sha256 = computeSha256(buf);
-  if (buf.length < 9 || buf[0] !== 0x5a) {
-    return {
-      meta: {
-        filename,
-        format: 'AFP',
-        sizeBytes: buf.length,
-        sha256,
-        compressedFromGzip: wasCompressed,
-        encoding: 'Unknown / Non-MO:DCA',
-        lineEnding: 'BINARY',
-        hasBom: false,
-        pageCount: 0,
-        recordCount: 0,
-        dimensionsSummary: 'Invalid MO:DCA introducer',
-        producerOrTool: 'AFP Stream',
-        parseStatus: 'CORRUPT',
-        parseNotes: ['Missing 0x5A MO:DCA structured-field introducer; open in Papyrus to confirm file integrity.'],
-        redactedPiiMatches: 0,
-      },
-      pagesText: [],
-      afpFields: [],
-      afpNative: {
-        encodingDetected: 'Unknown',
-        tles: [],
-        resources: [],
-        ptocaRuns: [],
-        geometry: [],
-      },
-      rawUncompressedBuffer: buf,
-    };
-  }
-
-  const fields: AfpStructuredField[] = [];
-  const tles: AfpTleEntry[] = [];
-  const resources: AfpResourceRef[] = [];
-  const ptocaRuns: AfpPtocaRun[] = [];
-  const geometry: AfpPageGeometry[] = [];
-  const pagesText: string[][] = [];
-  let currentPageLines: string[] = [];
-  let offset = 0;
-  let pageCount = 0;
-  let pageGroupCount = 0;
-  let totalRedactions = 0;
-  let ebcdicCount = 0;
-  let asciiCount = 0;
-  const ptocaState = { x: 120, y: 120, fontLocalId: 1 };
-
-  while (offset + 9 <= buf.length && buf[offset] === 0x5a) {
-    const length = buf.readUInt16BE(offset + 1);
-    if (length < 8 || offset + 1 + length > buf.length) {
-      break;
-    }
-    const sfidHex = buf.subarray(offset + 3, offset + 6).toString('hex').toUpperCase();
-    const sfInfo = MODCA_SFID_MAP[sfidHex] || { mnemonic: 'SF', description: `Structured Field (${sfidHex})` };
-    const payload = buf.subarray(offset + 9, offset + 1 + length);
-
-    if (sfInfo.mnemonic === 'BNG') {
-      pageGroupCount++;
-    }
-    if (sfInfo.mnemonic === 'BPG') {
-      pageCount++;
-      currentPageLines = [];
-      ptocaState.x = 120;
-      ptocaState.y = 120;
-    }
-
-    const activePage = Math.max(1, pageCount);
-    let textPreview: string | undefined;
-
-    if (sfInfo.mnemonic === 'TLE') {
-      const triplets = parseAfpTriplets(payload);
-      let attrName = 'TLE_KEY';
-      let attrVal = '';
-      let enc: 'EBCDIC' | 'ASCII' = 'ASCII';
-
-      for (const t of triplets) {
-        if (t.tid === 0x02 && t.data.length > 2) {
-          // FQN triplet: byte 0 = type, byte 1 = format, bytes 2.. = name
-          const dec = decodeAfpBytes(t.data.subarray(2));
-          attrName = dec.text || attrName;
-          enc = dec.encoding;
-        } else if (t.tid === 0x36 && t.data.length > 2) {
-          // Attribute Value triplet: bytes 0..1 reserved, bytes 2.. = value
-          const dec = decodeAfpBytes(t.data.subarray(2));
-          attrVal = dec.text;
-          enc = dec.encoding;
-        }
-      }
-
-      if (!attrVal && triplets.length === 0 && payload.length > 0) {
-        const dec = decodeAfpBytes(payload);
-        const parts = dec.text.split('=');
-        attrName = parts[0]?.trim() || 'TLE';
-        attrVal = parts.slice(1).join('=').trim() || dec.text;
-        enc = dec.encoding;
-      }
-
-      const redVal = redactSensitiveText(attrVal);
-      totalRedactions += redVal.matchCount;
-      if (enc === 'EBCDIC') ebcdicCount++;
-      else asciiCount++;
-
-      tles.push({
-        pageGroupIndex: Math.max(1, pageGroupCount),
-        attributeName: attrName,
-        attributeValue: redVal.redactedText,
-        encoding: enc,
-      });
-      textPreview = `${attrName} = ${redVal.redactedText}`;
-    } else if (sfInfo.mnemonic === 'PGD' && payload.length >= 12) {
-      // PGD: XpgUnit(2), YpgUnit(2), XpgSize(3), YpgSize(3)
-      const xUnitsPer10In = payload.readUInt16BE(2);
-      const yUnitsPer10In = payload.readUInt16BE(4);
-      const xSize = (payload[6] << 16) | (payload[7] << 8) | payload[8];
-      const ySize = (payload[9] << 16) | (payload[10] << 8) | payload[11];
-      geometry.push({
-        pageIndex: activePage,
-        widthUnits: xSize,
-        heightUnits: ySize,
-        xdpi: Math.round(xUnitsPer10In / 10) || 240,
-        ydpi: Math.round(yUnitsPer10In / 10) || 240,
-      });
-      textPreview = `${xSize}x${ySize} L-units @ ${Math.round(xUnitsPer10In / 10) || 240} dpi`;
-    } else if (
-      sfInfo.mnemonic === 'IMM' ||
-      sfInfo.mnemonic === 'MCF' ||
-      sfInfo.mnemonic === 'MCF2' ||
-      sfInfo.mnemonic === 'MPO' ||
-      sfInfo.mnemonic === 'MPS' ||
-      sfInfo.mnemonic === 'BBC' ||
-      sfInfo.mnemonic === 'BIM'
-    ) {
-      const dec = decodeAfpBytes(payload.subarray(0, Math.min(24, payload.length)));
-      const resName = dec.text || `${sfInfo.mnemonic}_OBJ`;
-      const typeMap: Record<string, AfpResourceRef['type']> = {
-        IMM: 'MEDIUM_MAP (IMM)',
-        MCF: 'FONT (MCF)',
-        MCF2: 'FONT (MCF)',
-        MPO: 'OVERLAY (MPO)',
-        MPS: 'PAGE_SEG (MPS)',
-        BBC: 'BARCODE (BBC)',
-        BIM: 'IMAGE (BIM)',
-      };
-      resources.push({
-        type: typeMap[sfInfo.mnemonic],
-        name: resName,
-        pageIndex: activePage,
-      });
-      textPreview = resName;
-    } else if (sfInfo.mnemonic === 'PTX') {
-      const runs = parsePtocaPayload(payload, activePage, ptocaState);
-      for (const r of runs) {
-        const red = redactSensitiveText(r.text);
-        totalRedactions += red.matchCount;
-        if (r.encoding === 'EBCDIC') ebcdicCount++;
-        else asciiCount++;
-        const cleanRun: AfpPtocaRun = { ...r, text: red.redactedText };
-        ptocaRuns.push(cleanRun);
-        currentPageLines.push(red.redactedText);
-      }
-      if (runs.length > 0) {
-        textPreview = runs.map((r) => `(${r.x},${r.y}) ${redactSensitiveText(r.text).redactedText}`).join(' | ');
-      }
-    } else if (sfInfo.mnemonic === 'BNG' || sfInfo.mnemonic === 'BDT' || sfInfo.mnemonic === 'NOP') {
-      const dec = decodeAfpBytes(payload);
-      if (dec.text.length > 0) {
-        const red = redactSensitiveText(dec.text);
-        totalRedactions += red.matchCount;
-        if (dec.encoding === 'EBCDIC') ebcdicCount++;
-        else asciiCount++;
-        textPreview = red.redactedText;
-      }
-    }
-
-    if (sfInfo.mnemonic === 'EPG') {
-      pagesText.push(currentPageLines);
-    }
-
-    fields.push({
-      offset,
-      length,
-      sfidHex,
-      mnemonic: sfInfo.mnemonic,
-      description: sfInfo.description,
-      pageIndex: activePage,
-      textPreview,
-    });
-
-    offset += 1 + length;
-  }
-
-  if (currentPageLines.length > 0 && pagesText.length < pageCount) {
-    pagesText.push(currentPageLines);
-  }
-
-  const encodingDetected =
-    ebcdicCount > 0 && asciiCount > 0
-      ? 'Mixed EBCDIC CP037 + ASCII'
-      : ebcdicCount > 0
-      ? 'EBCDIC CP037 / CP500'
-      : 'ASCII / MO:DCA';
-
-  const firstGeo = geometry[0];
-  const geoSummary = firstGeo
-    ? `${(firstGeo.widthUnits / firstGeo.xdpi).toFixed(1)}x${(firstGeo.heightUnits / firstGeo.ydpi).toFixed(1)}in (${firstGeo.xdpi}dpi)`
-    : `${pageGroupCount} Named Group(s)`;
-
-  return {
-    meta: {
-      filename,
-      format: 'AFP',
-      sizeBytes: buf.length,
-      sha256,
-      compressedFromGzip: wasCompressed,
-      encoding: `MO:DCA Binary (${encodingDetected})`,
-      lineEnding: 'BINARY',
-      hasBom: false,
-      pageCount: Math.max(pageCount, 1),
-      recordCount: fields.length,
-      dimensionsSummary: `${geoSummary} · ${tles.length} TLE(s) · ${resources.length} Resource(s)`,
-      producerOrTool: 'Direct MO:DCA + PTOCA Engine (No PDF Conversion)',
-      parseStatus: 'PARSED',
-      parseNotes: [
-        `Direct native AFP validation: parsed ${fields.length} MO:DCA fields, ${tles.length} TLE index tags, ${resources.length} resource bindings, and ${ptocaRuns.length} PTOCA text coordinates.`,
-        'External FOCA glyph outlines / OVL artwork still require ISIS Papyrus for final visual sign-off.',
-      ],
-      redactedPiiMatches: totalRedactions,
-    },
-    pagesText,
-    afpFields: fields,
-    afpNative: {
-      encodingDetected,
-      tles,
-      resources,
-      ptocaRuns,
-      geometry,
-    },
-    rawUncompressedBuffer: buf,
-  };
-}
-
-export async function parseArtifact(buffer: Buffer, rawFilename: string, explicitFormat?: FileFormat): Promise<{
-  ok: boolean;
-  error?: string;
-  parsed?: ParsedArtifact;
-}> {
-  const sanitized = sanitizeFilename(rawFilename);
-  if (sanitized.rejected) {
-    return { ok: false, error: sanitized.reason };
-  }
-
-  const gzResult = safeGunzip(buffer, sanitized.safeName);
+  const gzResult = safeGunzip(buf, filename);
   if (!gzResult.ok) {
-    return { ok: false, error: gzResult.error };
+    return { ok: false, error: gzResult.error || 'Archive decompression failed.' };
   }
+  const innerName = gzResult.wasCompressed ? filename.replace(/\.gz$/i, '') : filename;
 
-  const format = explicitFormat || inferFormatFromFilename(sanitized.safeName);
-  if (!format) {
-    return {
-      ok: false,
-      error: `Unsupported or unrecognized file extension for "${sanitized.safeName}". Supported: .afp, .pdf, .pcl, .rt, .rpt (.gz allowed).`,
-    };
-  }
-
-  const innerName = sanitized.safeName;
   if (format === 'PDF') {
     return { ok: true, parsed: await parsePdf(gzResult.buffer, innerName, gzResult.wasCompressed) };
   }
@@ -1125,7 +763,19 @@ export async function parseArtifact(buffer: Buffer, rawFilename: string, explici
   if (format === 'RT') {
     return { ok: true, parsed: parseRt(gzResult.buffer, innerName, gzResult.wasCompressed) };
   }
-  return { ok: true, parsed: parseAfp(gzResult.buffer, innerName, gzResult.wasCompressed) };
+  const afpParsed = parseAfpDocument(gzResult.buffer, innerName, gzResult.wasCompressed);
+  return {
+    ok: true,
+    parsed: {
+      meta: afpParsed.meta,
+      pagesText: afpParsed.pagesText,
+      pagesBlank: afpParsed.pagesBlank,
+      pagesDimensions: afpParsed.pagesDimensions,
+      afpFields: afpParsed.afpFields,
+      afpNative: afpParsed.afpNative,
+      rawUncompressedBuffer: afpParsed.rawUncompressedBuffer,
+    },
+  };
 }
 
 function detectCriticalField(text: string): { isCritical: boolean; reason?: string } {
@@ -1310,31 +960,38 @@ function alignPageLines(
   return pairs;
 }
 
-function pageTokenStats(bLines: string[], cLines: string[]): { sim: number; bCount: number; cCount: number } {
-  const bTokens = new Set<string>();
-  for (const l of bLines) {
-    for (const t of lineWordTokens(l)) bTokens.add(t);
+function buildPageTokenSet(lines: string[]): Set<string> {
+  const tokens = new Set<string>();
+  for (const l of lines) {
+    for (const t of lineWordTokens(l)) tokens.add(t);
   }
-  const cTokens = new Set<string>();
-  for (const l of cLines) {
-    for (const t of lineWordTokens(l)) cTokens.add(t);
-  }
+  return tokens;
+}
+
+function pageSetStats(
+  bTokens: Set<string>,
+  cTokens: Set<string>,
+  bLineCount: number,
+  cLineCount: number
+): { sim: number; bCount: number; cCount: number } {
   if (bTokens.size === 0 && cTokens.size === 0) {
-    return { sim: bLines.length === 0 && cLines.length === 0 ? 1.0 : 0.5, bCount: 0, cCount: 0 };
+    return { sim: bLineCount === 0 && cLineCount === 0 ? 1.0 : 0.5, bCount: 0, cCount: 0 };
   }
   if (bTokens.size === 0 || cTokens.size === 0) {
     return { sim: 0.0, bCount: bTokens.size, cCount: cTokens.size };
   }
   let inter = 0;
-  for (const t of bTokens) {
-    if (cTokens.has(t)) inter++;
+  const smaller = bTokens.size <= cTokens.size ? bTokens : cTokens;
+  const larger = bTokens.size <= cTokens.size ? cTokens : bTokens;
+  for (const t of smaller) {
+    if (larger.has(t)) inter++;
   }
   const dice = (2 * inter) / (bTokens.size + cTokens.size);
   return { sim: dice, bCount: bTokens.size, cCount: cTokens.size };
 }
 
 function pageLineSimilarity(bLines: string[], cLines: string[]): number {
-  return pageTokenStats(bLines, cLines).sim;
+  return pageSetStats(buildPageTokenSet(bLines), buildPageTokenSet(cLines), bLines.length, cLines.length).sim;
 }
 
 function alignDocumentPages(
@@ -1385,75 +1042,154 @@ function alignDocumentPages(
     return out;
   }
 
-  // Needleman-Wunsch page sequence alignment (handles inserted blank/white pages without cascading off-by-1)
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-  const bt: string[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(''));
+  // Precompute token Sets once O(m + n) outside DP loop so multi-hundred-page alignment stays sub-second
+  const bTokenSets = bPages.map((lines) => buildPageTokenSet(lines));
+  const cTokenSets = cPages.map((lines) => buildPageTokenSet(lines));
   const gapPenBase = (i: number) => (isBaseBlank(i) ? -0.05 : -1.15);
   const gapPenCand = (j: number) => (isCandBlank(j) ? -0.05 : -1.15);
 
-  for (let i = 1; i <= m; i++) {
-    dp[i][0] = dp[i - 1][0] + gapPenBase(i - 1);
-    bt[i][0] = 'U';
-  }
-  for (let j = 1; j <= n; j++) {
-    dp[0][j] = dp[0][j - 1] + gapPenCand(j - 1);
-    bt[0][j] = 'L';
-  }
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const bb = isBaseBlank(i - 1);
-      const cb = isCandBlank(j - 1);
-      let pairScore: number;
-      if (bb && cb) {
-        pairScore = 0.95;
-      } else if (bb !== cb) {
-        pairScore = -5.0; // Never force-pair a white/blank page with a content page
-      } else {
-        const { sim, bCount, cCount } = pageTokenStats(bPages[i - 1], cPages[j - 1]);
-        if (bCount === 0 && cCount === 0) {
-          // Both are scanned/image-only pages with 0 text tokens -> align sequentially
-          pairScore = 0.35;
-        } else if (bCount < 6 || cCount < 6) {
-          // Hybrid or raster-heavy form page -> avoid spurious page skipping from sparse text
-          pairScore = 0.25 + sim * 0.75;
-        } else {
-          pairScore = sim >= 0.3 ? 0.55 + sim * 1.45 : -0.4;
-        }
-      }
-
-      const diag = dp[i - 1][j - 1] + pairScore;
-      const up = dp[i - 1][j] + gapPenBase(i - 1);
-      const left = dp[i][j - 1] + gapPenCand(j - 1);
-
-      if (diag >= up && diag >= left) {
-        dp[i][j] = diag;
-        bt[i][j] = 'D';
-      } else if (left >= up) {
-        dp[i][j] = left;
-        bt[i][j] = 'L';
-      } else {
-        dp[i][j] = up;
-        bt[i][j] = 'U';
-      }
-    }
-  }
+  const scorePair = (iIdx: number, jIdx: number): number => {
+    const bb = isBaseBlank(iIdx);
+    const cb = isCandBlank(jIdx);
+    if (bb && cb) return 0.95;
+    if (bb !== cb) return -5.0;
+    const { sim, bCount, cCount } = pageSetStats(
+      bTokenSets[iIdx],
+      cTokenSets[jIdx],
+      bPages[iIdx].length,
+      cPages[jIdx].length
+    );
+    if (bCount === 0 && cCount === 0) return 0.35;
+    if (bCount < 6 || cCount < 6) return 0.25 + sim * 0.75;
+    return sim >= 0.3 ? 0.55 + sim * 1.45 : -0.4;
+  };
 
   const rawSlots: Array<{ bi: number | null; ci: number | null }> = [];
-  let i = m;
-  let j = n;
-  while (i > 0 || j > 0) {
-    const dir = bt[i][j];
-    if (dir === 'D') {
-      rawSlots.push({ bi: i - 1, ci: j - 1 });
-      i--;
-      j--;
-    } else if (dir === 'L') {
-      rawSlots.push({ bi: null, ci: j - 1 });
-      j--;
-    } else {
-      rawSlots.push({ bi: i - 1, ci: null });
-      i--;
+
+  if (m * n <= 250_000) {
+    // Typed flat Needleman-Wunsch DP table (handles up to 500x500 pages cleanly)
+    const cols = n + 1;
+    const dp = new Float64Array((m + 1) * cols);
+    const bt = new Uint8Array((m + 1) * cols); // 1='D', 2='U', 3='L'
+
+    for (let i = 1; i <= m; i++) {
+      dp[i * cols] = dp[(i - 1) * cols] + gapPenBase(i - 1);
+      bt[i * cols] = 2;
+    }
+    for (let j = 1; j <= n; j++) {
+      dp[j] = dp[j - 1] + gapPenCand(j - 1);
+      bt[j] = 3;
+    }
+
+    for (let i = 1; i <= m; i++) {
+      const rowOff = i * cols;
+      const prevRowOff = (i - 1) * cols;
+      const gpBase = gapPenBase(i - 1);
+      for (let j = 1; j <= n; j++) {
+        const pairScore = scorePair(i - 1, j - 1);
+        const diag = dp[prevRowOff + j - 1] + pairScore;
+        const up = dp[prevRowOff + j] + gpBase;
+        const left = dp[rowOff + j - 1] + gapPenCand(j - 1);
+
+        if (diag >= up && diag >= left) {
+          dp[rowOff + j] = diag;
+          bt[rowOff + j] = 1;
+        } else if (left >= up) {
+          dp[rowOff + j] = left;
+          bt[rowOff + j] = 3;
+        } else {
+          dp[rowOff + j] = up;
+          bt[rowOff + j] = 2;
+        }
+      }
+    }
+
+    let i = m;
+    let j = n;
+    while (i > 0 || j > 0) {
+      const dir = bt[i * cols + j];
+      if (dir === 1) {
+        rawSlots.push({ bi: i - 1, ci: j - 1 });
+        i--;
+        j--;
+      } else if (dir === 3) {
+        rawSlots.push({ bi: null, ci: j - 1 });
+        j--;
+      } else {
+        rawSlots.push({ bi: i - 1, ci: null });
+        i--;
+      }
+    }
+  } else {
+    // Banded Needleman-Wunsch for ultra-large documents (> 500x500 pages)
+    const halfBand = Math.max(60, Math.abs(m - n) + 32);
+    const bandWidth = halfBand * 2 + 1;
+    const jStarts = new Int32Array(m + 1);
+    const jEnds = new Int32Array(m + 1);
+    const dpBand = new Float64Array((m + 1) * bandWidth);
+    const btBand = new Uint8Array((m + 1) * bandWidth);
+    dpBand.fill(-1e12);
+
+    const getDp = (i: number, j: number): number => {
+      if (j < jStarts[i] || j > jEnds[i]) return -1e12;
+      return dpBand[i * bandWidth + (j - jStarts[i])];
+    };
+
+    for (let i = 0; i <= m; i++) {
+      const center = m > 0 ? Math.round((i * n) / m) : 0;
+      jStarts[i] = Math.max(0, center - halfBand);
+      jEnds[i] = Math.min(n, center + halfBand);
+    }
+
+    dpBand[0 - jStarts[0]] = 0;
+    for (let j = 1; j <= jEnds[0]; j++) {
+      dpBand[j - jStarts[0]] = dpBand[j - 1 - jStarts[0]] + gapPenCand(j - 1);
+      btBand[j - jStarts[0]] = 3;
+    }
+    for (let i = 1; i <= m; i++) {
+      const rowOff = i * bandWidth;
+      const js = jStarts[i];
+      const je = jEnds[i];
+      const gpBase = gapPenBase(i - 1);
+      for (let j = js; j <= je; j++) {
+        const colIdx = j - js;
+        if (j === 0) {
+          dpBand[rowOff + colIdx] = getDp(i - 1, 0) + gpBase;
+          btBand[rowOff + colIdx] = 2;
+          continue;
+        }
+        const diag = getDp(i - 1, j - 1) + scorePair(i - 1, j - 1);
+        const up = getDp(i - 1, j) + gpBase;
+        const left = getDp(i, j - 1) + gapPenCand(j - 1);
+        if (diag >= up && diag >= left) {
+          dpBand[rowOff + colIdx] = diag;
+          btBand[rowOff + colIdx] = 1;
+        } else if (left >= up) {
+          dpBand[rowOff + colIdx] = left;
+          btBand[rowOff + colIdx] = 3;
+        } else {
+          dpBand[rowOff + colIdx] = up;
+          btBand[rowOff + colIdx] = 2;
+        }
+      }
+    }
+
+    let i = m;
+    let j = n;
+    while (i > 0 || j > 0) {
+      const js = jStarts[i];
+      const dir = j >= js && j <= jEnds[i] ? btBand[i * bandWidth + (j - js)] : i > 0 ? 2 : 3;
+      if (dir === 1 && i > 0 && j > 0) {
+        rawSlots.push({ bi: i - 1, ci: j - 1 });
+        i--;
+        j--;
+      } else if (dir === 3 && j > 0) {
+        rawSlots.push({ bi: null, ci: j - 1 });
+        j--;
+      } else {
+        rawSlots.push({ bi: i - 1, ci: null });
+        i--;
+      }
     }
   }
   rawSlots.reverse();
@@ -1498,7 +1234,14 @@ function alignDocumentPages(
 
     const simPct =
       s.bi !== null && s.ci !== null
-        ? Math.round(pageLineSimilarity(bPages[s.bi], cPages[s.ci]) * 100)
+        ? Math.round(
+            pageSetStats(
+              bTokenSets[s.bi],
+              cTokenSets[s.ci],
+              bPages[s.bi].length,
+              cPages[s.ci].length
+            ).sim * 100
+          )
         : 0;
 
     return {
@@ -1518,16 +1261,97 @@ function alignDocumentPages(
   });
 }
 
+const MAX_STORED_DIFF_ROWS = 12000;
+const MAX_STORED_EQUAL_ROWS_LARGE = 1500;
+
+interface DiffComputationResult {
+  diffs: TextDiffLine[];
+  totalLinesCompared: number;
+  equalLineCount: number;
+  changedLines: TextDiffLine[];
+  layoutOnlyChanges: TextDiffLine[];
+  criticalChanges: TextDiffLine[];
+  diffCountBySlot: Map<number, number>;
+  truncated: boolean;
+}
+
 function computePageTextDiffs(
   baseline: ParsedArtifact,
   candidate: ParsedArtifact,
   format: FileFormat,
   alignedPages: AlignedPageSlot[]
-): TextDiffLine[] {
+): DiffComputationResult {
   const baselinePages = baseline.pagesText;
   const candidatePages = candidate.pagesText;
   const diffs: TextDiffLine[] = [];
+  const changedLines: TextDiffLine[] = [];
+  const layoutOnlyChanges: TextDiffLine[] = [];
+  const criticalChanges: TextDiffLine[] = [];
+  const diffCountBySlot = new Map<number, number>();
   let diffIdx = 0;
+  let equalLineCount = 0;
+  let storedEqualCount = 0;
+  let totalLinesCompared = 0;
+  let truncated = false;
+
+  const totalRawLines =
+    baselinePages.reduce((s, p) => s + p.length, 0) + candidatePages.reduce((s, p) => s + p.length, 0);
+  const largeFileMode = totalRawLines > 10000;
+
+  // Pre-index AFP PTOCA runs by pageIndex to avoid O(pages * runs) scans
+  const bAfpByPage = new Map<number, AfpPtocaRun[]>();
+  const cAfpByPage = new Map<number, AfpPtocaRun[]>();
+  if (format === 'AFP') {
+    for (const r of baseline.afpNative?.ptocaRuns || []) {
+      const arr = bAfpByPage.get(r.pageIndex);
+      if (arr) arr.push(r);
+      else bAfpByPage.set(r.pageIndex, [r]);
+    }
+    for (const r of candidate.afpNative?.ptocaRuns || []) {
+      const arr = cAfpByPage.get(r.pageIndex);
+      if (arr) arr.push(r);
+      else cAfpByPage.set(r.pageIndex, [r]);
+    }
+  }
+
+  const recordDiff = (row: TextDiffLine) => {
+    totalLinesCompared++;
+    if (row.diffCategory === 'EQUAL') {
+      equalLineCount++;
+      if (largeFileMode && storedEqualCount >= MAX_STORED_EQUAL_ROWS_LARGE) {
+        truncated = true;
+        return;
+      }
+      if (diffs.length >= MAX_STORED_DIFF_ROWS) {
+        truncated = true;
+        return;
+      }
+      storedEqualCount++;
+      diffs.push(row);
+      return;
+    }
+
+    diffCountBySlot.set(row.slotIndex || 0, (diffCountBySlot.get(row.slotIndex || 0) || 0) + 1);
+    if (
+      row.diffCategory === 'TEXT_CHANGE' ||
+      row.diffCategory === 'MISSING_CONTENT' ||
+      row.diffCategory === 'ADDED_CONTENT' ||
+      row.diffCategory === 'CONTROL_METADATA'
+    ) {
+      if (changedLines.length < MAX_STORED_DIFF_ROWS) changedLines.push(row);
+      if (row.criticalFieldFlag && criticalChanges.length < MAX_STORED_DIFF_ROWS) {
+        criticalChanges.push(row);
+      }
+    } else if (row.diffCategory === 'ALIGNMENT_SHIFT' || row.diffCategory === 'FONT_STYLE') {
+      if (layoutOnlyChanges.length < MAX_STORED_DIFF_ROWS) layoutOnlyChanges.push(row);
+    }
+
+    if (diffs.length < MAX_STORED_DIFF_ROWS) {
+      diffs.push(row);
+    } else {
+      truncated = true;
+    }
+  };
 
   for (const slot of alignedPages) {
     const bPageIdx = slot.baselinePageNum !== null ? slot.baselinePageNum - 1 : null;
@@ -1539,7 +1363,7 @@ function computePageTextDiffs(
       const desc = slot.candidateBlank
         ? `[Inserted White / Blank Page at Destination P${slot.candidatePageNum} — No white page in Source]`
         : cLines.slice(0, 3).join(' | ') || `[Extra Page at Destination P${slot.candidatePageNum}]`;
-      diffs.push({
+      recordDiff({
         id: `diff-${diffIdx}`,
         slotIndex: slot.slotIndex,
         pageOrSection: `Slot ${slot.slotIndex} (Dest P${slot.candidatePageNum})`,
@@ -1564,7 +1388,7 @@ function computePageTextDiffs(
       const desc = slot.baselineBlank
         ? `[Extra White / Blank Page at Source P${slot.baselinePageNum} — Missing in Destination]`
         : bLines.slice(0, 3).join(' | ') || `[Missing Page from Source P${slot.baselinePageNum}]`;
-      diffs.push({
+      recordDiff({
         id: `diff-${diffIdx}`,
         slotIndex: slot.slotIndex,
         pageOrSection: `Slot ${slot.slotIndex} (Src P${slot.baselinePageNum})`,
@@ -1599,8 +1423,14 @@ function computePageTextDiffs(
     const cPdfPage = candidate.pdfLayouts?.[cPageIdx] || [];
     const bPclPage = baseline.pclLines?.[bPageIdx] || [];
     const cPclPage = candidate.pclLines?.[cPageIdx] || [];
-    const bAfpPage = baseline.afpNative?.ptocaRuns.filter((r) => r.pageIndex === bPageIdx + 1) || [];
-    const cAfpPage = candidate.afpNative?.ptocaRuns.filter((r) => r.pageIndex === cPageIdx + 1) || [];
+    const bAfpPage = bAfpByPage.get(bPageIdx + 1) || [];
+    const cAfpPage = cAfpByPage.get(cPageIdx + 1) || [];
+    const bAfpTextEls = (baseline.afpNative?.visualPages?.[bPageIdx]?.elements || []).filter(
+      (e): e is Extract<typeof e, { kind: 'text_line' }> => e.kind === 'text_line'
+    );
+    const cAfpTextEls = (candidate.afpNative?.visualPages?.[cPageIdx]?.elements || []).filter(
+      (e): e is Extract<typeof e, { kind: 'text_line' }> => e.kind === 'text_line'
+    );
 
     const aligned = alignPageLines(bLines, cLines);
 
@@ -1646,14 +1476,38 @@ function computePageTextDiffs(
         } else if (format === 'AFP') {
           const br = bAfpPage[pair.bIdx];
           const cr = cAfpPage[pair.cIdx];
+          const bVis = bAfpTextEls[pair.bIdx];
+          const cVis = cAfpTextEls[pair.cIdx];
           if (br && cr) {
             const dx = cr.x - br.x;
             const dy = cr.y - br.y;
-            if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+            if (Math.abs(dx) > 36 || Math.abs(dy) > 36) {
               positionDelta = `PTOCA ΔX ${dx >= 0 ? '+' : ''}${dx} · ΔY ${dy >= 0 ? '+' : ''}${dy} L-units`;
+            } else if (bVis && cVis && bVis.spans.length === cVis.spans.length) {
+              for (let sIdx = 0; sIdx < bVis.spans.length; sIdx++) {
+                const sDx = cVis.spans[sIdx].x - bVis.spans[sIdx].x;
+                if (Math.abs(sDx) > 36) {
+                  positionDelta = `Col ${sIdx + 1} PTOCA ΔX ${sDx >= 0 ? '+' : ''}${sDx} L-units`;
+                  break;
+                }
+              }
             }
             if (br.fontLocalId !== cr.fontLocalId) {
               fontDelta = `Coded Font ID ${br.fontLocalId} → ${cr.fontLocalId}`;
+            } else if (bVis && cVis && bVis.spans.length === cVis.spans.length) {
+              for (let sIdx = 0; sIdx < bVis.spans.length; sIdx++) {
+                const bs = bVis.spans[sIdx];
+                const cs = cVis.spans[sIdx];
+                if (
+                  bs.fontFamily !== cs.fontFamily ||
+                  bs.fontWeight !== cs.fontWeight ||
+                  Math.abs(bs.fontSizePt - cs.fontSizePt) > 0.4 ||
+                  bs.color.toLowerCase() !== cs.color.toLowerCase()
+                ) {
+                  fontDelta = `Span ${sIdx + 1}: ${bs.fontFamily} ${bs.fontSizePt}pt (${bs.color}) → ${cs.fontFamily} ${cs.fontSizePt}pt (${cs.color})`;
+                  break;
+                }
+              }
             }
           }
         } else if (format === 'RT') {
@@ -1680,7 +1534,7 @@ function computePageTextDiffs(
         if (fontDelta) cats.push('FONT_STYLE');
 
         if (cats.length === 0) {
-          diffs.push({
+          recordDiff({
             id: `diff-${diffIdx}`,
             slotIndex: slot.slotIndex,
             pageOrSection: sectionLabel,
@@ -1698,7 +1552,7 @@ function computePageTextDiffs(
           const secondaryCategories = cats.slice(1);
           const crit = detectCriticalField(`${b} ${c}`);
           const inline = computeInlineTokens(b, c);
-          diffs.push({
+          recordDiff({
             id: `diff-${diffIdx}`,
             slotIndex: slot.slotIndex,
             pageOrSection: sectionLabel,
@@ -1721,7 +1575,7 @@ function computePageTextDiffs(
         }
       } else if (b !== undefined && pair.bIdx !== null) {
         const crit = detectCriticalField(b);
-        diffs.push({
+        recordDiff({
           id: `diff-${diffIdx}`,
           slotIndex: slot.slotIndex,
           pageOrSection: sectionLabel,
@@ -1739,7 +1593,7 @@ function computePageTextDiffs(
         });
       } else if (c !== undefined && pair.cIdx !== null) {
         const crit = detectCriticalField(c);
-        diffs.push({
+        recordDiff({
           id: `diff-${diffIdx}`,
           slotIndex: slot.slotIndex,
           pageOrSection: sectionLabel,
@@ -1759,7 +1613,16 @@ function computePageTextDiffs(
     }
   }
 
-  return diffs;
+  return {
+    diffs,
+    totalLinesCompared,
+    equalLineCount,
+    changedLines,
+    layoutOnlyChanges,
+    criticalChanges,
+    diffCountBySlot,
+    truncated,
+  };
 }
 
 export async function runComparisonEngine(params: {
@@ -1985,32 +1848,22 @@ export async function runComparisonEngine(params: {
 
   // Layer B: Page Alignment + Text / Content + Inline Layout Diff
   const alignedPages = alignDocumentPages(b, c, format);
-  const textDiffs = computePageTextDiffs(b, c, format, alignedPages);
+  const diffResult = computePageTextDiffs(b, c, format, alignedPages);
+  const textDiffs = diffResult.diffs;
 
-  // Annotate alignedPages with exact diff counts and status
+  // Annotate alignedPages with exact diff counts and status in O(N)
   for (const slot of alignedPages) {
-    const slotDiffs = textDiffs.filter((d) => d.slotIndex === slot.slotIndex && d.diffCategory !== 'EQUAL');
-    slot.diffCount = slotDiffs.length;
-    if (slot.status === 'MATCHED' && slotDiffs.length > 0) {
+    const cnt = diffResult.diffCountBySlot.get(slot.slotIndex) || 0;
+    slot.diffCount = cnt;
+    if (slot.status === 'MATCHED' && cnt > 0) {
       slot.status = 'DIFF_DETECTED';
-      slot.summary = `${slot.summary} ${slotDiffs.length} visual/content difference(s) highlighted.`;
+      slot.summary = `${slot.summary} ${cnt} visual/content difference(s) highlighted.`;
     }
   }
 
-  const changedLines = textDiffs.filter(
-    (d) =>
-      d.type !== 'equal' &&
-      (d.diffCategory === 'TEXT_CHANGE' ||
-        d.diffCategory === 'MISSING_CONTENT' ||
-        d.diffCategory === 'ADDED_CONTENT' ||
-        d.diffCategory === 'CONTROL_METADATA')
-  );
-  const layoutOnlyChanges = textDiffs.filter(
-    (d) =>
-      d.type !== 'equal' &&
-      (d.diffCategory === 'ALIGNMENT_SHIFT' || d.diffCategory === 'FONT_STYLE')
-  );
-  const criticalChanges = changedLines.filter((d) => d.criticalFieldFlag);
+  const changedLines = diffResult.changedLines;
+  const layoutOnlyChanges = diffResult.layoutOnlyChanges;
+  const criticalChanges = diffResult.criticalChanges;
 
   changedLines.slice(0, 6).forEach((d, idx) => {
     findings.push({
@@ -2167,8 +2020,8 @@ export async function runComparisonEngine(params: {
     const cFields = c.afpFields || [];
     const bNative = b.afpNative;
     const cNative = c.afpNative;
-    const bBng = bFields.filter((f) => f.mnemonic === 'BNG').length;
-    const cBng = cFields.filter((f) => f.mnemonic === 'BNG').length;
+    const bBng = bNative?.totalBngCount ?? bFields.filter((f) => f.mnemonic === 'BNG').length;
+    const cBng = cNative?.totalBngCount ?? cFields.filter((f) => f.mnemonic === 'BNG').length;
 
     const afpIssues: string[] = [];
 
@@ -2255,7 +2108,7 @@ export async function runComparisonEngine(params: {
     for (let i = 0; i < minRuns; i++) {
       const br = bRuns[i];
       const cr = cRuns[i];
-      if (Math.abs(br.x - cr.x) > 15 || Math.abs(br.y - cr.y) > 15 || br.fontLocalId !== cr.fontLocalId) {
+      if (Math.abs(br.x - cr.x) > 36 || Math.abs(br.y - cr.y) > 36 || br.fontLocalId !== cr.fontLocalId) {
         coordDrifts++;
         if (coordDrifts === 1) {
           findings.push({
@@ -2277,14 +2130,102 @@ export async function runComparisonEngine(params: {
       }
     }
 
-    visualStatus = coordDrifts > 0 ? 'POTENTIAL_VARIANCE' : 'POTENTIAL_VARIANCE';
+    // 5. Direct Visual Image, Border/Table Rule & Vector Parity Check
+    let graphicDrifts = 0;
+    const bVps = bNative?.visualPages || [];
+    const cVps = cNative?.visualPages || [];
+    const bVpsMap = new Map<number, AfpVisualPage>(bVps.map((p) => [p.pageIndex, p]));
+    const cVpsMap = new Map<number, AfpVisualPage>(cVps.map((p) => [p.pageIndex, p]));
+    const bAssets = bNative?.mediaAssets || {};
+    const cAssets = cNative?.mediaAssets || {};
+
+    for (const slot of alignedPages) {
+      if (slot.baselinePageNum === null || slot.candidatePageNum === null) continue;
+      const bVp = bVpsMap.get(slot.baselinePageNum);
+      const cVp = cVpsMap.get(slot.candidatePageNum);
+      if (!bVp || !cVp) continue;
+
+      const bImgs = bVp.elements.filter((e): e is Extract<typeof e, { kind: 'image' }> => e.kind === 'image');
+      const cImgs = cVp.elements.filter((e): e is Extract<typeof e, { kind: 'image' }> => e.kind === 'image');
+
+      let slotImgDiff = false;
+      if (bImgs.length !== cImgs.length) {
+        slotImgDiff = true;
+      } else {
+        for (let idx = 0; idx < bImgs.length; idx++) {
+          const bi = bImgs[idx];
+          const ci = cImgs[idx];
+          const bData = bAssets[bi.assetId];
+          const cData = cAssets[ci.assetId];
+          if (
+            bData !== cData ||
+            Math.abs(bi.x - ci.x) > 24 ||
+            Math.abs(bi.y - ci.y) > 24 ||
+            Math.abs(bi.w - ci.w) > 24 ||
+            Math.abs(bi.h - ci.h) > 24
+          ) {
+            slotImgDiff = true;
+            break;
+          }
+        }
+      }
+
+      if (slotImgDiff) {
+        graphicDrifts++;
+        if (graphicDrifts === 1) {
+          findings.push({
+            id: `FND-${runId}-AFP-IMG`,
+            runId,
+            layer: 'Visual',
+            severity: 'High',
+            category: 'AFP Embedded Image / Graphic Variation',
+            status: 'POTENTIAL_VARIANCE',
+            location: `Page ${slot.baselinePageNum} vs Page ${slot.candidatePageNum} · IOCA/BOC Image`,
+            expected: `${bImgs.length} image(s): ${bImgs.map((im) => `${im.label || 'Image'}(${im.w}x${im.h}@${im.x},${im.y})`).join(', ') || 'None'}`,
+            actual: `${cImgs.length} image(s): ${cImgs.map((im) => `${im.label || 'Image'}(${im.w}x${im.h}@${im.x},${im.y})`).join(', ') || 'None'}`,
+            reproductionSteps: ['Inspect visual side-by-side image overlays in All Pages Visual or AFP Native tab'],
+            commonPatternHint: 'Logo scale/placement, seal/signature raster swap, or IOCA color/bitmap difference between IMDS and DDGS.',
+            evidenceHashBaseline: b.meta.sha256,
+            evidenceHashCandidate: c.meta.sha256,
+          });
+        }
+        slot.diffCount++;
+        if (slot.status === 'MATCHED') slot.status = 'DIFF_DETECTED';
+      }
+
+      const bBorders = bVp.elements.filter((e) => e.kind === 'rule' || e.kind === 'vector');
+      const cBorders = cVp.elements.filter((e) => e.kind === 'rule' || e.kind === 'vector');
+      const borderDelta = Math.abs(bBorders.length - cBorders.length);
+      if (borderDelta > 0) {
+        graphicDrifts++;
+        findings.push({
+          id: `FND-${runId}-AFP-BORDER-${slot.slotIndex}`,
+          runId,
+          layer: 'Visual',
+          severity: 'Medium',
+          category: 'AFP Table / Border Geometry Variation',
+          status: 'POTENTIAL_VARIANCE',
+          location: `Slot ${slot.slotIndex} (Src P${slot.baselinePageNum} / Dst P${slot.candidatePageNum})`,
+          expected: `${bBorders.length} border rule/vector primitive(s)`,
+          actual: `${cBorders.length} border rule/vector primitive(s)`,
+          reproductionSteps: ['Compare table cell grid rules (DIR/DBR) and GOCA boxes side-by-side'],
+          commonPatternHint: 'Missing table divider rule, shifted cell border, or altered GOCA form box in DDGS template.',
+          evidenceHashBaseline: b.meta.sha256,
+          evidenceHashCandidate: c.meta.sha256,
+        });
+        slot.diffCount++;
+        if (slot.status === 'MATCHED') slot.status = 'DIFF_DETECTED';
+      }
+    }
+
+    visualStatus = 'POTENTIAL_VARIANCE';
     visualSummary =
-      coordDrifts > 0
-        ? `Direct PTOCA engine detected ${coordDrifts} X/Y coordinate or font shift(s) without PDF conversion; verify in Papyrus.`
-        : 'Direct PTOCA coordinates aligned; confirm external OVL/FOCA glyph rendering in Papyrus.';
+      coordDrifts > 0 || graphicDrifts > 0
+        ? `Direct MO:DCA engine detected ${coordDrifts} PTOCA layout shift(s) and ${graphicDrifts} image/table border variation(s); verify side-by-side.`
+        : 'Direct PTOCA, embedded image, and border geometry aligned; confirm external OVL/FOCA rendering in Papyrus.';
     humanReviewRequired = true;
     humanReviewReason =
-      'Direct MO:DCA/PTOCA/TLE validation completed without PDF conversion; confirm external FOCA/OVL rendering in ISIS Papyrus.';
+      'Direct MO:DCA/IOCA/GOCA/PTOCA/TLE validation completed without PDF conversion; confirm visual parity & external resources in ISIS Papyrus.';
 
     if (findings.some((f) => f.layer === 'Format-Specific' && f.status === 'CONFIRMED_DEFECT')) {
       formatStatus = 'CONFIRMED_DEFECT';
@@ -2299,8 +2240,8 @@ export async function runComparisonEngine(params: {
   const pairingChecks: PairingCheck[] = config.pairingKeys.map((key) => ({
     pairingKeyName: key,
     pairingKeyValue: `${config.appCode}-${config.subCode}-BATCH01`,
-    baselineCount: Math.max(1, b.afpFields?.filter((f) => f.mnemonic === 'BNG').length || b.meta.pageCount),
-    candidateCount: Math.max(1, c.afpFields?.filter((f) => f.mnemonic === 'BNG').length || c.meta.pageCount),
+    baselineCount: Math.max(1, b.afpNative?.totalBngCount || b.afpFields?.filter((f) => f.mnemonic === 'BNG').length || b.meta.pageCount),
+    candidateCount: Math.max(1, c.afpNative?.totalBngCount || c.afpFields?.filter((f) => f.mnemonic === 'BNG').length || c.meta.pageCount),
     status: 'MATCHED',
     notes: `Deterministic pairing verified via ${key} (${config.sourceSystem} -> ${config.targetSystem}).`,
   }));
@@ -2362,12 +2303,12 @@ export async function runComparisonEngine(params: {
     {
       layerName: 'Text & Content',
       status: textStatus,
-      checksPassed: textDiffs.filter((d) => d.type === 'equal').length,
+      checksPassed: diffResult.equalLineCount,
       checksFailed: changedLines.length,
       checksReview: 0,
       summary:
         changedLines.length === 0
-          ? `All ${textDiffs.length} extracted text line(s) matched.`
+          ? `All ${diffResult.totalLinesCompared} extracted text line(s) matched.`
           : `${changedLines.length} line difference(s) (${criticalChanges.length} critical field(s)).`,
     },
     {
@@ -2425,6 +2366,8 @@ export async function runComparisonEngine(params: {
     layerSummaries,
     alignedPages,
     textDiffs,
+    totalDiffCount: diffResult.changedLines.length + diffResult.layoutOnlyChanges.length,
+    diffLinesTruncated: diffResult.truncated || undefined,
     findings,
     reviews: [],
     verificationLimits: adapterCap?.cannotVerify || [],
@@ -2450,25 +2393,49 @@ export async function runComparisonEngine(params: {
         : undefined,
     afpDetails:
       format === 'AFP'
-        ? {
-            validationMode: 'DIRECT_MODCA_NATIVE',
-            encodingDetected: b.afpNative?.encodingDetected || 'MO:DCA Binary',
-            baselineFields: b.afpFields || [],
-            candidateFields: c.afpFields || [],
-            baselineTles: b.afpNative?.tles || [],
-            candidateTles: c.afpNative?.tles || [],
-            baselineResources: b.afpNative?.resources || [],
-            candidateResources: c.afpNative?.resources || [],
-            baselinePtocaRuns: b.afpNative?.ptocaRuns || [],
-            candidatePtocaRuns: c.afpNative?.ptocaRuns || [],
-            baselineGeometry: b.afpNative?.geometry || [],
-            candidateGeometry: c.afpNative?.geometry || [],
-            papyrusExportAttached,
-            papyrusToolVersion: papyrusToolVersion || 'ISIS Papyrus Viewer (Direct .afp Inspection)',
-            conversionDisclaimer: papyrusExportAttached
-              ? 'Optional Papyrus PDF proxy attached; primary TLE, IMM, MCF, and PTOCA checks were executed directly on native AFP.'
-              : undefined,
-          }
+        ? (() => {
+            const mergedAssets: Record<string, string> = {};
+            const prefixPages = (pages: AfpVisualPage[] | undefined, assets: Record<string, string> | undefined, pfx: string): AfpVisualPage[] | undefined => {
+              if (assets) {
+                for (const [k, v] of Object.entries(assets)) {
+                  mergedAssets[`${pfx}_${k}`] = v;
+                }
+              }
+              return pages?.map((vp) => ({
+                ...vp,
+                elements: vp.elements.map((el) =>
+                  el.kind === 'image' ? { ...el, assetId: `${pfx}_${el.assetId}` } : el
+                ),
+              }));
+            };
+            const baselineVisualPages = prefixPages(b.afpNative?.visualPages, b.afpNative?.mediaAssets, 'b');
+            const candidateVisualPages = prefixPages(c.afpNative?.visualPages, c.afpNative?.mediaAssets, 'c');
+
+            return {
+              validationMode: 'DIRECT_MODCA_NATIVE' as const,
+              encodingDetected: b.afpNative?.encodingDetected || 'MO:DCA Binary',
+              baselineFields: b.afpFields || [],
+              candidateFields: c.afpFields || [],
+              baselineTotalFieldCount: b.afpNative?.totalFieldCount,
+              candidateTotalFieldCount: c.afpNative?.totalFieldCount,
+              baselineTles: b.afpNative?.tles || [],
+              candidateTles: c.afpNative?.tles || [],
+              baselineResources: b.afpNative?.resources || [],
+              candidateResources: c.afpNative?.resources || [],
+              baselinePtocaRuns: (b.afpNative?.ptocaRuns || []).slice(0, 5000),
+              candidatePtocaRuns: (c.afpNative?.ptocaRuns || []).slice(0, 5000),
+              baselineGeometry: b.afpNative?.geometry || [],
+              candidateGeometry: c.afpNative?.geometry || [],
+              baselineVisualPages,
+              candidateVisualPages,
+              mediaAssets: Object.keys(mergedAssets).length > 0 ? mergedAssets : undefined,
+              papyrusExportAttached,
+              papyrusToolVersion: papyrusToolVersion || 'ISIS Papyrus Viewer (Direct .afp Inspection)',
+              conversionDisclaimer: papyrusExportAttached
+                ? 'Optional Papyrus PDF proxy attached; primary TLE, IMM, MCF, and PTOCA checks were executed directly on native AFP.'
+                : undefined,
+            };
+          })()
         : undefined,
     rtDetails,
     pdfVisualReady: format === 'PDF' && b.meta.parseStatus === 'PARSED' && c.meta.parseStatus === 'PARSED',

@@ -15,13 +15,14 @@ import { AllPagesVisualCompare } from './AllPagesVisualCompare';
 
 interface RunInspectorProps {
   run: ComparisonRun;
+  loadingDetail?: boolean;
   onBack: () => void;
   onRunUpdated: (updated: ComparisonRun) => void;
 }
 
 type InspectorTab = 'visualCompare' | 'sideBySide' | 'visual' | 'structural' | 'findings' | 'review';
 
-export function RunInspector({ run, onBack, onRunUpdated }: RunInspectorProps) {
+export function RunInspector({ run, loadingDetail, onBack, onRunUpdated }: RunInspectorProps) {
   const [activeTab, setActiveTab] = useState<InspectorTab>('visualCompare');
   const [visualInitialPage, setVisualInitialPage] = useState<number>(1);
 
@@ -58,7 +59,8 @@ export function RunInspector({ run, onBack, onRunUpdated }: RunInspectorProps) {
           papyrusChecklistCompleted: run.format === 'AFP' ? papyrusChecklist : undefined,
         }),
       });
-      const data = await res.json();
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : {};
       if (!res.ok) throw new Error(data.error || 'Failed to record sign-off');
       onRunUpdated(data.run);
       setRationale('');
@@ -69,7 +71,7 @@ export function RunInspector({ run, onBack, onRunUpdated }: RunInspectorProps) {
     }
   };
 
-  const diffLineCount = run.textDiffs.filter((d) => d.diffCategory !== 'EQUAL').length;
+  const diffLineCount = run.totalDiffCount ?? run.textDiffs.filter((d) => d.diffCategory !== 'EQUAL').length;
 
   return (
     <div className="space-y-6">
@@ -202,7 +204,13 @@ export function RunInspector({ run, onBack, onRunUpdated }: RunInspectorProps) {
       </div>
 
       {/* TAB 0: ALL-PAGES VISUAL SIDE-BY-SIDE COMPARE */}
-      {activeTab === 'visualCompare' && <AllPagesVisualCompare run={run} />}
+      {(run.isSummary || loadingDetail) && (
+        <div className="rounded-lg border border-blue-200 bg-blue-50 px-5 py-4 text-xs text-blue-900">
+          Loading aligned page slots, visual stream layers, and detailed diffs for {run.id}...
+        </div>
+      )}
+
+      {!run.isSummary && activeTab === 'visualCompare' && <AllPagesVisualCompare run={run} />}
 
       {/* TAB 1: STRUCTURAL & PAIRING */}
       {activeTab === 'structural' && (
@@ -339,7 +347,7 @@ export function RunInspector({ run, onBack, onRunUpdated }: RunInspectorProps) {
       )}
 
       {/* TAB 1: COLOR-CODED SIDE-BY-SIDE COMPARISON */}
-      {activeTab === 'sideBySide' && (
+      {!run.isSummary && activeTab === 'sideBySide' && (
         <SideBySideDiffView
           run={run}
           onJumpToVisualPage={(pageNum) => {
@@ -350,7 +358,7 @@ export function RunInspector({ run, onBack, onRunUpdated }: RunInspectorProps) {
       )}
 
       {/* TAB 2: VISUAL & FORMAT-SPECIFIC VIEW */}
-      {activeTab === 'visual' && (
+      {!run.isSummary && activeTab === 'visual' && (
         <div className="space-y-6">
           {/* PDF LIVE CANVAS DIFF */}
           {run.format === 'PDF' && run.pdfVisualReady && (

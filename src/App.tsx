@@ -33,6 +33,7 @@ export default function App() {
   const [configs, setConfigs] = useState<InventoryConfigRule[]>([]);
   const [designPack, setDesignPack] = useState<DesignPackData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingRunDetail, setLoadingRunDetail] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Filters
@@ -116,6 +117,25 @@ export default function App() {
 
   const handleRunUpdated = (updated: ComparisonRun) => {
     setRuns((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+  };
+
+  const handleSelectRun = async (run: ComparisonRun) => {
+    setSelectedRunId(run.id);
+    if (!run.isSummary) return;
+    setLoadingRunDetail(true);
+    try {
+      const res = await fetch(`/api/runs/${encodeURIComponent(run.id)}`);
+      const raw = await res.text();
+      const data = raw ? JSON.parse(raw) : {};
+      if (!res.ok) throw new Error(data.error || 'Failed to load run details.');
+      if (data.run) {
+        setRuns((prev) => prev.map((r) => (r.id === data.run.id ? data.run : r)));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to load full comparison run.');
+    } finally {
+      setLoadingRunDetail(false);
+    }
   };
 
   const breadcrumbLabel =
@@ -248,6 +268,7 @@ export default function App() {
           {nav === 'runs' && selectedRun && (
             <RunInspector
               run={selectedRun}
+              loadingDetail={loadingRunDetail}
               onBack={() => setSelectedRunId(null)}
               onRunUpdated={handleRunUpdated}
             />
@@ -378,7 +399,7 @@ export default function App() {
                         filteredRuns.map((run) => (
                           <tr
                             key={run.id}
-                            onClick={() => setSelectedRunId(run.id)}
+                            onClick={() => handleSelectRun(run)}
                             className="cursor-pointer hover:bg-slate-50 transition-colors"
                           >
                             <td className="px-4 py-3 font-mono font-semibold text-blue-700 whitespace-nowrap">

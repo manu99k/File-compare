@@ -32,8 +32,13 @@ export function PdfVisualDiff({
   const [totalPages, setTotalPages] = useState(1);
   const [sensitivity, setSensitivity] = useState(28);
   const [showSemanticBoxes, setShowSemanticBoxes] = useState(true);
-  const [loading, setLoading] = useState(true);
+  const [loadingDocs, setLoadingDocs] = useState(true);
+  const [renderingPage, setRenderingPage] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [docs, setDocs] = useState<{
+    baseDoc: pdfjsLib.PDFDocumentProxy | null;
+    candDoc: pdfjsLib.PDFDocumentProxy | null;
+  }>({ baseDoc: null, candDoc: null });
   const [diffStats, setDiffStats] = useState<{
     changedPixels: number;
     totalPixels: number;
@@ -52,11 +57,12 @@ export function PdfVisualDiff({
 
   useEffect(() => {
     let cancelled = false;
+    let loadedBase: pdfjsLib.PDFDocumentProxy | null = null;
+    let loadedCand: pdfjsLib.PDFDocumentProxy | null = null;
 
-    async function renderAndDiff() {
-      setLoading(true);
+    async function loadDocuments() {
+      setLoadingDocs(true);
       setError(null);
-
       try {
         const [baseRes, candRes] = await Promise.all([
           fetch(baselineUrl),
@@ -71,15 +77,49 @@ export function PdfVisualDiff({
           candRes.arrayBuffer(),
         ]);
 
-        const [baseDoc, candDoc] = await Promise.all([
+        const [bPdf, cPdf] = await Promise.all([
           pdfjsLib.getDocument({ data: new Uint8Array(baseBuf) }).promise,
           pdfjsLib.getDocument({ data: new Uint8Array(candBuf) }).promise,
         ]);
 
-        if (cancelled) return;
-
-        const maxP = Math.max(baseDoc.numPages, candDoc.numPages);
+        if (cancelled) {
+          bPdf.loadingTask.destroy().catch(() => {});
+          cPdf.loadingTask.destroy().catch(() => {});
+          return;
+        }
+        loadedBase = bPdf;
+        loadedCand = cPdf;
+        const maxP = Math.max(bPdf.numPages, cPdf.numPages);
         setTotalPages(maxP);
+        setDocs({ baseDoc: bPdf, candDoc: cPdf });
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Unable to load PDF documents.');
+        }
+      } finally {
+        if (!cancelled) setLoadingDocs(false);
+      }
+    }
+
+    loadDocuments();
+    return () => {
+      cancelled = true;
+      loadedBase?.loadingTask.destroy().catch(() => {});
+      loadedCand?.loadingTask.destroy().catch(() => {});
+    };
+  }, [baselineUrl, candidateUrl]);
+
+  useEffect(() => {
+    const { baseDoc, candDoc } = docs;
+    if (!baseDoc || !candDoc) return;
+
+    let cancelled = false;
+
+    async function renderAndDiff() {
+      setRenderingPage(true);
+
+      try {
+        const maxP = Math.max(baseDoc!.numPages, candDoc!.numPages);
         const safePage = Math.min(pageNumber, maxP);
 
         const renderPage = async (
@@ -102,24 +142,28 @@ export function PdfVisualDiff({
           }
 
           const page = await doc.getPage(pNum);
-          const unscaled = page.getViewport({ scale: 1 });
-          const targetWidth = 420;
-          const scale = targetWidth / unscaled.width;
-          const viewport = page.getViewport({ scale });
+          try {
+            const unscaled = page.getViewport({ scale: 1 });
+            const targetWidth = 420;
+            const scale = targetWidth / unscaled.width;
+            const viewport = page.getViewport({ scale });
 
-          canvas.width = Math.round(viewport.width);
-          canvas.height = Math.round(viewport.height);
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
+            canvas.width = Math.round(viewport.width);
+            canvas.height = Math.round(viewport.height);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-          await page.render({ canvasContext: ctx, viewport, canvas }).promise;
-          return {
-            width: canvas.width,
-            height: canvas.height,
-            ptDims: `${Math.round(unscaled.width)} x ${Math.round(unscaled.height)} pt`,
-            viewport,
-            scale,
-          };
+            await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+            return {
+              width: canvas.width,
+              height: canvas.height,
+              ptDims: `${Math.round(unscaled.width)} x ${Math.round(unscaled.height)} pt`,
+              viewport,
+              scale,
+            };
+          } finally {
+            page.cleanup();
+          }
         };
 
         const baseCanvas = baseCanvasRef.current;
@@ -128,8 +172,8 @@ export function PdfVisualDiff({
         if (!baseCanvas || !candCanvas || !diffCanvas) return;
 
         const [bInfo, cInfo] = await Promise.all([
-          renderPage(baseDoc, safePage, baseCanvas),
-          renderPage(candDoc, safePage, candCanvas),
+          renderPage(baseDoc!, safePage, baseCanvas),
+          renderPage(candDoc!, safePage, candCanvas),
         ]);
 
         if (cancelled) return;
@@ -257,7 +301,7 @@ export function PdfVisualDiff({
           setError(err instanceof Error ? err.message : 'PDF rendering failed.');
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setRenderingPage(false);
       }
     }
 
@@ -265,7 +309,9 @@ export function PdfVisualDiff({
     return () => {
       cancelled = true;
     };
-  }, [baselineUrl, candidateUrl, pageNumber, sensitivity, showSemanticBoxes, pdfDetails, textDiffs]);
+  }, [docs, pageNumber, sensitivity, showSemanticBoxes, pdfDetails, textDiffs]);
+
+  const loading = loadingDocs || renderingPage;
 
   const exceedsTolerance = diffStats ? diffStats.pct > tolerancePct : false;
 

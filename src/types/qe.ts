@@ -93,6 +93,82 @@ export interface AfpPageGeometry {
   ydpi: number;
 }
 
+export interface AfpTextSpan {
+  x: number;
+  text: string;
+  fontSizePt: number;
+  fontFamily: 'sans-serif' | 'serif' | 'monospace';
+  fontWeight: 'normal' | 'bold';
+  fontStyle: 'normal' | 'italic';
+  color: string;
+}
+
+export type AfpVisualElement =
+  | {
+      kind: 'image';
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      assetId: string;
+      label?: string;
+    }
+  | {
+      kind: 'barcode';
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      rotation: number;
+      value: string;
+      symbology: string;
+    }
+  | {
+      kind: 'rule';
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      color: string;
+    }
+  | {
+      kind: 'vector';
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      viewW: number;
+      viewH: number;
+      paths: Array<{ d: string; fill?: string; stroke?: string; strokeWidth?: number }>;
+    }
+  | {
+      kind: 'external_ref';
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      resType: 'PAGE_SEG' | 'OVERLAY';
+      name: string;
+    }
+  | {
+      kind: 'text_line';
+      lineNum: number;
+      x: number;
+      y: number;
+      rotation: number;
+      spans: AfpTextSpan[];
+      fullText: string;
+    };
+
+export interface AfpVisualPage {
+  pageIndex: number;
+  widthUnits: number;
+  heightUnits: number;
+  xdpi: number;
+  ydpi: number;
+  elements: AfpVisualElement[];
+}
+
 export interface RtControlCheck {
   label: string;
   baselineValue: string;
@@ -225,6 +301,7 @@ export interface ComparisonLayerSummary {
 export interface ComparisonRun {
   id: string;
   createdAt: string;
+  isSummary?: boolean;
   mvp: string;
   appCode: string;
   subCode: string;
@@ -240,6 +317,8 @@ export interface ComparisonRun {
   layerSummaries: ComparisonLayerSummary[];
   alignedPages: AlignedPageSlot[];
   textDiffs: TextDiffLine[];
+  totalDiffCount?: number;
+  diffLinesTruncated?: boolean;
   findings: FindingRecord[];
   reviews: ReviewDecisionRecord[];
   verificationLimits: string[];
@@ -262,6 +341,8 @@ export interface ComparisonRun {
     encodingDetected: string;
     baselineFields: AfpStructuredField[];
     candidateFields: AfpStructuredField[];
+    baselineTotalFieldCount?: number;
+    candidateTotalFieldCount?: number;
     baselineTles: AfpTleEntry[];
     candidateTles: AfpTleEntry[];
     baselineResources: AfpResourceRef[];
@@ -270,6 +351,9 @@ export interface ComparisonRun {
     candidatePtocaRuns: AfpPtocaRun[];
     baselineGeometry: AfpPageGeometry[];
     candidateGeometry: AfpPageGeometry[];
+    baselineVisualPages?: AfpVisualPage[];
+    candidateVisualPages?: AfpVisualPage[];
+    mediaAssets?: Record<string, string>;
     papyrusExportAttached: boolean;
     papyrusToolVersion?: string;
     conversionDisclaimer?: string;

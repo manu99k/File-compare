@@ -2,8 +2,9 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import type { ConfigValidationResult, InventoryConfigRule } from '../src/types/qe.ts';
 
-const MAX_DECOMPRESSED_BYTES = 15 * 1024 * 1024; // 15 MB prototype cap
-const MAX_GZIP_RATIO = 50;
+export const MAX_UPLOAD_FILE_BYTES = 500 * 1024 * 1024; // 500 MB per uploaded file
+const MAX_DECOMPRESSED_BYTES = 500 * 1024 * 1024; // 500 MB decompressed payload cap
+const MAX_GZIP_RATIO = 120;
 
 export function computeSha256(buf: Buffer): string {
   return crypto.createHash('sha256').update(buf).digest('hex');
@@ -111,8 +112,8 @@ export function redactSensitiveText(input: string): { redactedText: string; matc
     return '[REDACTED-EMAIL]';
   });
 
-  // Long unmasked 12-16 digit account/card numbers (preserve last 4 digits if not already masked)
-  text = text.replace(/\b(\d{8,12})(\d{4})\b/g, (_m, _prefix, last4) => {
+  // Long unmasked 12-16 digit account/card numbers (preserve last 4 digits; do not mangle *030101100001* mailroom barcodes)
+  text = text.replace(/(?<!\*)\b(\d{8,12})(\d{4})\b(?!\*)/g, (_m, _prefix, last4) => {
     matchCount++;
     return `****-****-${last4}`;
   });

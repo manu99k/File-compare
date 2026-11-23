@@ -17,6 +17,19 @@ export function NewComparisonView({ configs, onRunCreated }: NewComparisonViewPr
 
   const selectedConfig = configs.find((c) => c.id === selectedConfigId) || configs[0];
 
+  const parseResponseJson = async (res: Response) => {
+    const text = await res.text();
+    try {
+      return text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(
+        res.ok
+          ? 'Unexpected non-JSON response from server.'
+          : `Server returned HTTP ${res.status}: ${text.replace(/<[^>]+>/g, ' ').trim().slice(0, 180) || res.statusText}`
+      );
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!baselineFile || !candidateFile) {
@@ -38,7 +51,7 @@ export function NewComparisonView({ configs, onRunCreated }: NewComparisonViewPr
         method: 'POST',
         body: fd,
       });
-      const data = await res.json();
+      const data = await parseResponseJson(res);
       if (!res.ok) throw new Error(data.error || 'Comparison failed');
       onRunCreated(data.run);
     } catch (err) {
@@ -57,7 +70,7 @@ export function NewComparisonView({ configs, onRunCreated }: NewComparisonViewPr
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scenario }),
       });
-      const data = await res.json();
+      const data = await parseResponseJson(res);
       if (!res.ok) throw new Error(data.error || 'Negative test failed');
       onRunCreated(data.run);
     } catch (err) {
@@ -131,7 +144,9 @@ export function NewComparisonView({ configs, onRunCreated }: NewComparisonViewPr
                 className="block w-full text-xs text-slate-600 file:mr-3 file:rounded file:border file:border-slate-300 file:bg-white file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-slate-700"
               />
               <div className="text-[11px] text-slate-500">
-                Accepts .afp, .pdf, .pcl, .rt, .rpt, or .gz compressed containers
+                {baselineFile
+                  ? `${baselineFile.name} (${(baselineFile.size / (1024 * 1024)).toFixed(2)} MB)`
+                  : 'Accepts .afp, .pdf, .pcl, .rt, .rpt, or .gz (up to 500 MB per file / 500 MB decompressed)'}
               </div>
             </div>
 
@@ -146,7 +161,9 @@ export function NewComparisonView({ configs, onRunCreated }: NewComparisonViewPr
                 className="block w-full text-xs text-slate-600 file:mr-3 file:rounded file:border file:border-slate-300 file:bg-white file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-slate-700"
               />
               <div className="text-[11px] text-slate-500">
-                Processed locally in memory; PII tokens redacted in findings
+                {candidateFile
+                  ? `${candidateFile.name} (${(candidateFile.size / (1024 * 1024)).toFixed(2)} MB)`
+                  : 'Processed locally in memory up to 500 MB; PII tokens redacted in findings'}
               </div>
             </div>
           </div>

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import { createComplexAfpFormPair } from '../server/complexAfpFixture.ts';
 
 const SAMPLES_DIR = path.resolve(process.cwd(), 'samples/cibc');
 
@@ -76,9 +77,60 @@ function makePgdPayload(widthUnits: number, heightUnits: number, dpi = 240): Buf
   return buf;
 }
 
-function makePtocaPayload(runs: Array<{ x: number; y: number; fontId: number; text: string }>): Buffer {
+function makeCibcIocaLogoFields(seqStart: number): Buffer[] {
+  const w = 24;
+  const h = 24;
+  const rowBytes = 3;
+  const bitmap = Buffer.alloc(rowBytes * h, 0);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dy = Math.abs(y - 11.5);
+      const dx = Math.abs(x - 11.5);
+      if (dx + dy >= 5 && dx + dy <= 10.5) {
+        bitmap[y * rowBytes + Math.floor(x / 8)] |= 1 << (7 - (x % 8));
+      }
+    }
+  }
+  const idd = Buffer.alloc(21);
+  idd.writeUInt16BE(2400, 1);
+  idd.writeUInt16BE(2400, 3);
+  idd.writeUInt16BE(w, 5);
+  idd.writeUInt16BE(h, 7);
+  idd[9] = 0xf6;
+  idd[10] = 0x0a;
+  idd.writeUInt16BE(2400, 12);
+  idd.writeUInt16BE(2400, 14);
+  idd.writeUInt16BE(w, 16);
+  idd.writeUInt16BE(h, 18);
+  const ipd = Buffer.concat([
+    Buffer.from([0x70, 0x00, 0x91, 0x01, 0xff, 0x95, 0x02, 0x03, 0x01, 0x96, 0x01, 0x01]),
+    Buffer.from([0xfe, 0x92, 0x00, bitmap.length]),
+    bitmap,
+    Buffer.from([0x93, 0x00, 0x71, 0x00]),
+  ]);
+  return [
+    makeModcaField('D3A85F', seqStart, encodeEbcdic('SEG_CIBC_LOGO')),
+    makeModcaField('D3A8FB', seqStart + 1, encodeEbcdic('IMG_CIBC_01')),
+    makeModcaField('D3A6FB', seqStart + 2, idd),
+    makeModcaField('D3EEFB', seqStart + 3, ipd),
+    makeModcaField('D3A9FB', seqStart + 4),
+    makeModcaField('D3A95F', seqStart + 5),
+  ];
+}
+
+function makePtocaPayload(
+  runs: Array<{ x: number; y: number; fontId: number; text: string; sto?: number }>
+): Buffer {
   const chunks: Buffer[] = [Buffer.from([0x2b, 0xd3])];
   for (const r of runs) {
+    if (typeof r.sto === 'number') {
+      const sto = Buffer.alloc(6);
+      sto[0] = 6;
+      sto[1] = 0xf7;
+      sto.writeUInt16BE(r.sto, 2);
+      sto.writeUInt16BE((r.sto + 0x2d00) & 0xffff, 4);
+      chunks.push(sto);
+    }
     const ami = Buffer.alloc(4);
     ami[0] = 4;
     ami[1] = 0xc7;
@@ -93,7 +145,14 @@ function makePtocaPayload(runs: Array<{ x: number; y: number; fontId: number; te
     const textBuf = encodeEbcdic(r.text);
     const trn = Buffer.concat([Buffer.from([2 + textBuf.length, 0xdb]), textBuf]);
     chunks.push(ami, amb, scfl, trn);
+    if (typeof r.sto === 'number') {
+      chunks.push(Buffer.from([6, 0xf7, 0x00, 0x00, 0x2d, 0x00]));
+    }
   }
+  const rAmi = Buffer.alloc(4); rAmi[0] = 4; rAmi[1] = 0xc7; rAmi.writeInt16BE(180, 2);
+  const rAmb = Buffer.alloc(4); rAmb[0] = 4; rAmb[1] = 0xd3; rAmb.writeInt16BE(355, 2);
+  const dir = Buffer.alloc(7); dir[0] = 7; dir[1] = 0xe5; dir.writeInt16BE(1680, 2); dir.writeInt16BE(3, 4);
+  chunks.push(rAmi, rAmb, dir);
   return Buffer.concat(chunks);
 }
 
@@ -197,48 +256,58 @@ async function buildCibcPdfSamples() {
 
 function buildCibcAfpPclRtSamples() {
   // 5. CIBC Synthetic AFP MO:DCA Binary Pair (Direct Native Validation, Zero PDF Conversion)
-  const buildCibcAfp = (candidateVariant: boolean) =>
-    Buffer.concat([
+  const buildCibcAfp = (candidateVariant: boolean) => {
+    const ips = Buffer.concat([encodeEbcdic('SEG_CIBC'), Buffer.from([0, 0, 180, 0, 0, 110])]);
+    return Buffer.concat([
       makeModcaField('D3A8A8', 1, encodeEbcdic('DOC_CIBC_DDA_010')), // BDT
-      makeModcaField('D3ABCC', 2, encodeEbcdic(candidateVariant ? 'SIMPLEX1' : 'DUPLEX01')), // IMM drift
-      makeModcaField('D3A8AD', 3, encodeEbcdic('GRP_CIBC_TOK_010')), // BNG
-      makeModcaField('D3A090', 4, makeTlePayload('INST_CODE', '010_CIBC_CA')),
-      makeModcaField('D3A090', 5, makeTlePayload('FORM_ID', 'CIBC_12419_DDA')),
-      makeModcaField('D3A090', 6, makeTlePayload('MAIL_TRAY', candidateVariant ? 'TRAY_02' : 'TRAY_01')),
-      makeModcaField('D3A8AF', 7, encodeEbcdic('PAGE_0001')), // BPG
-      makeModcaField('D3A8C9', 8), // BAG
-      makeModcaField('D3A6AF', 9, makePgdPayload(2040, 2640, 240)), // PGD
-      makeModcaField('D3AB8A', 10, encodeEbcdic('C0CIBC01_HELV10')), // MCF
-      makeModcaField('D3ABD8', 11, encodeEbcdic('O1CIBCLG_LOGO')), // MPO
-      makeModcaField('D3A9C9', 12), // EAG
-      makeModcaField('D3A8DF', 13), // BPT
+      ...makeCibcIocaLogoFields(2),
+      makeModcaField('D3ABCC', 10, encodeEbcdic(candidateVariant ? 'SIMPLEX1' : 'DUPLEX01')), // IMM drift
+      makeModcaField('D3A8AD', 11, encodeEbcdic('GRP_CIBC_TOK_010')), // BNG
+      makeModcaField('D3A090', 12, makeTlePayload('INST_CODE', '010_CIBC_CA')),
+      makeModcaField('D3A090', 13, makeTlePayload('FORM_ID', 'CIBC_12419_DDA')),
+      makeModcaField('D3A090', 14, makeTlePayload('MAIL_TRAY', candidateVariant ? 'TRAY_02' : 'TRAY_01')),
+      makeModcaField('D3A8AF', 15, encodeEbcdic('PAGE_0001')), // BPG
+      makeModcaField('D3A8C9', 16), // BAG
+      makeModcaField('D3A6AF', 17, makePgdPayload(2040, 2640, 240)), // PGD
+      makeModcaField('D3AB8A', 18, encodeEbcdic('C0CIBC01_HELV10')), // MCF
+      makeModcaField('D3ABD8', 19, encodeEbcdic('O1CIBCLG_LOGO')), // MPO
+      makeModcaField('D3A9C9', 20), // EAG
+      makeModcaField('D3AF5F', 21, ips), // IPS CIBC Logo Segment
+      makeModcaField('D3A8DF', 22), // BPT
       makeModcaField(
         'D3EE9B',
-        14,
+        23,
         makePtocaPayload([
-          { x: 180, y: 240, fontId: 1, text: 'CIBC PERSONAL BANKING - SMART PLUS CHEQUING STATEMENT' },
-          { x: 180, y: 310, fontId: 1, text: 'INSTITUTION: 010  TRANSIT: 00012  ACCT: ****-****-4410' },
-          { x: 180, y: 400, fontId: 2, text: 'MONTHLY ACCOUNT FEE: $16.95  (WAIVED OVER $4,000.00)' },
+          { x: 310, y: 155, fontId: 2, text: 'CIBC PERSONAL BANKING - SMART PLUS CHEQUING STATEMENT' },
+          { x: 180, y: 260, fontId: 1, text: 'INSTITUTION: 010  TRANSIT: 00012  ACCT: ****-****-4410' },
+          { x: 180, y: 310, fontId: 1, text: 'MONTHLY ACCOUNT FEE: $16.95  (WAIVED OVER $4,000.00)' },
           {
             x: 180,
-            y: candidateVariant ? 518 : 470,
+            y: candidateVariant ? 518 : 430,
             fontId: candidateVariant ? 3 : 2,
             text: candidateVariant
               ? 'CLOSING BALANCE: $12,480.00  FORM 12419-DDGS'
               : 'CLOSING BALANCE: $12,480.00  FORM 12419-IMDS',
           },
+          { x: 95, y: 1750, fontId: 4, sto: 0x8700, text: '*030101100001*' },
         ])
       ), // PTX
-      makeModcaField('D3A9DF', 15), // EPT
-      makeModcaField('D3A8EB', 16, encodeEbcdic('CPC_POST_BARCODE_010')), // BBC
-      makeModcaField('D3A9EB', 17), // EBC
-      makeModcaField('D3A9AF', 18), // EPG
-      makeModcaField('D3A9AD', 19), // ENG
-      makeModcaField('D3A9A8', 20), // EDT
+      makeModcaField('D3A9DF', 24), // EPT
+      makeModcaField('D3A8EB', 25, encodeEbcdic('CPC_POST_BARCODE_010')), // BBC
+      makeModcaField('D3A9EB', 26), // EBC
+      makeModcaField('D3A9AF', 27), // EPG
+      makeModcaField('D3A9AD', 28), // ENG
+      makeModcaField('D3A9A8', 29), // EDT
     ]);
+  };
 
   fs.writeFileSync(path.join(SAMPLES_DIR, 'IMDS_CIBC_DDA_STMT.afp'), buildCibcAfp(false));
   fs.writeFileSync(path.join(SAMPLES_DIR, 'DDGS_CIBC_DDA_STMT.afp'), buildCibcAfp(true));
+
+  // 5b. Complex 2-Page CIBC Form AFP Pair (Overlay + GOCA + Tables + CCITT G4 / 24-bit RGB / 8-bit Gray Images + Barcodes)
+  const complexAfp = createComplexAfpFormPair();
+  fs.writeFileSync(path.join(SAMPLES_DIR, 'IMDS_CIBC_COMPLEX_FORM_2P.afp'), complexAfp.baseline);
+  fs.writeFileSync(path.join(SAMPLES_DIR, 'DDGS_CIBC_COMPLEX_FORM_2P.afp'), complexAfp.candidate);
 
   // 6. CIBC PCL5 Escrow / Pre-Authorized Notice Pair
   const pclBase =

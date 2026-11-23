@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { runComparisonEngine } from './adapters.ts';
+import { createComplexAfpFormPair } from './complexAfpFixture.ts';
 import type {
   ComparisonRun,
   DesignPackData,
@@ -629,9 +630,89 @@ function makePgdPayload(widthUnits: number, heightUnits: number, dpi: number): B
   return buf;
 }
 
-function makePtocaPayload(runs: Array<{ x: number; y: number; fontId: number; text: string }>): Buffer {
+function makeIocaLogoFields(seqStart: number): Buffer[] {
+  // 24x24 1-bit monochrome geometric diamond/chevron bank logo (3 bytes per row * 24 rows = 72 bytes)
+  const w = 24;
+  const h = 24;
+  const rowBytes = 3;
+  const bitmap = Buffer.alloc(rowBytes * h, 0);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const dy = Math.abs(y - 11.5);
+      const dx = Math.abs(x - 11.5);
+      const manhattan = dx + dy;
+      if ((manhattan >= 5 && manhattan <= 10.5) || (x >= 0 && x <= 3 && dy <= 5)) {
+        const byteIdx = y * rowBytes + Math.floor(x / 8);
+        bitmap[byteIdx] |= 1 << (7 - (x % 8));
+      }
+    }
+  }
+
+  // IDD (0xD3A6FB): Self-Defining Image Size parameter (0xF6)
+  const iddPayload = Buffer.alloc(21);
+  iddPayload[0] = 0x00; // units: 10 inches
+  iddPayload.writeUInt16BE(2400, 1); // Xres = 240 dpi
+  iddPayload.writeUInt16BE(2400, 3); // Yres = 240 dpi
+  iddPayload.writeUInt16BE(w, 5);
+  iddPayload.writeUInt16BE(h, 7);
+  // IOCA Image Size Self-Defining Field (0xF6)
+  iddPayload[9] = 0xf6;
+  iddPayload[10] = 0x0a;
+  iddPayload[11] = 0x00; // unit base 10in
+  iddPayload.writeUInt16BE(2400, 12);
+  iddPayload.writeUInt16BE(2400, 14);
+  iddPayload.writeUInt16BE(w, 16);
+  iddPayload.writeUInt16BE(h, 18);
+  iddPayload[20] = 0x00;
+
+  // IPD (0xD3EEFB): Begin Image Content (0x91) + Image Encoding (0x95 uncompressed) + Image Data (0xFE92) + End Image (0x93)
+  const ipdChunks = Buffer.concat([
+    Buffer.from([0x70, 0x00]), // Begin Segment
+    Buffer.from([0x91, 0x01, 0xff]), // Begin Image Content
+    Buffer.from([0x95, 0x02, 0x03, 0x01]), // Image Encoding: uncompressed 1-bit
+    Buffer.from([0x96, 0x01, 0x01]), // IDE size 1
+    Buffer.from([0xfe, 0x92, (bitmap.length >> 8) & 0xff, bitmap.length & 0xff]),
+    bitmap,
+    Buffer.from([0x93, 0x00]), // End Image Content
+    Buffer.from([0x71, 0x00]), // End Segment
+  ]);
+
+  return [
+    makeModcaField('D3A85F', seqStart, encodeEbcdic('SEG_BANK_LOGO')), // BPS
+    makeModcaField('D3A8FB', seqStart + 1, encodeEbcdic('IMG_LOGO_01')), // BIM
+    makeModcaField('D3A6FB', seqStart + 2, iddPayload), // IDD
+    makeModcaField('D3EEFB', seqStart + 3, ipdChunks), // IPD
+    makeModcaField('D3A9FB', seqStart + 4), // EIM
+    makeModcaField('D3A95F', seqStart + 5), // EPS
+  ];
+}
+
+function makeIpsPayload(segName: string, x: number, y: number): Buffer {
+  const nameBuf = encodeEbcdic(segName.padEnd(8, ' ').slice(0, 8));
+  const coords = Buffer.alloc(6);
+  coords[0] = (x >> 16) & 0xff;
+  coords[1] = (x >> 8) & 0xff;
+  coords[2] = x & 0xff;
+  coords[3] = (y >> 16) & 0xff;
+  coords[4] = (y >> 8) & 0xff;
+  coords[5] = y & 0xff;
+  return Buffer.concat([nameBuf, coords]);
+}
+
+function makePtocaPayload(
+  runs: Array<{ x: number; y: number; fontId: number; text: string; stoOrientation?: number }>
+): Buffer {
   const chunks: Buffer[] = [Buffer.from([0x2b, 0xd3])];
   for (const r of runs) {
+    if (typeof r.stoOrientation === 'number') {
+      const sto = Buffer.alloc(6);
+      sto[0] = 6;
+      sto[1] = 0xf7; // STO chained
+      sto.writeUInt16BE(r.stoOrientation, 2);
+      sto.writeUInt16BE((r.stoOrientation + 0x2d00) & 0xffff, 4);
+      chunks.push(sto);
+    }
+
     const ami = Buffer.alloc(4);
     ami[0] = 4;
     ami[1] = 0xc7; // AMI chained
@@ -646,7 +727,29 @@ function makePtocaPayload(runs: Array<{ x: number; y: number; fontId: number; te
     const textBuf = encodeEbcdic(r.text);
     const trn = Buffer.concat([Buffer.from([2 + textBuf.length, 0xdb]), textBuf]); // TRN chained
     chunks.push(ami, amb, scfl, trn);
+
+    if (typeof r.stoOrientation === 'number') {
+      // Restore upright text orientation 0deg
+      chunks.push(Buffer.from([6, 0xf7, 0x00, 0x00, 0x2d, 0x00]));
+    }
   }
+  // Draw a crisp horizontal rule under the statement header using PTOCA DIR (0xE5)
+  const ruleAmi = Buffer.alloc(4);
+  ruleAmi[0] = 4;
+  ruleAmi[1] = 0xc7;
+  ruleAmi.writeInt16BE(180, 2);
+  const ruleAmb = Buffer.alloc(4);
+  ruleAmb[0] = 4;
+  ruleAmb[1] = 0xd3;
+  ruleAmb.writeInt16BE(355, 2);
+  const dir = Buffer.alloc(7);
+  dir[0] = 7;
+  dir[1] = 0xe5; // DIR chained
+  dir.writeInt16BE(1680, 2);
+  dir.writeInt16BE(3, 4);
+  dir[6] = 0;
+  chunks.push(ruleAmi, ruleAmb, dir);
+
   return Buffer.concat(chunks);
 }
 
@@ -654,39 +757,46 @@ function createSyntheticAfpPair(): { baseline: Buffer; candidate: Buffer } {
   const buildAfp = (candidateVariant: boolean) => {
     const seqFields = [
       makeModcaField('D3A8A8', 1, encodeEbcdic('DOC_DDA_SYNTH_004')), // BDT
-      makeModcaField('D3ABCC', 2, encodeEbcdic(candidateVariant ? 'SIMPLEX1' : 'DUPLEX01')), // IMM (Duplex vs Simplex drift!)
-      makeModcaField('D3A8AD', 3, encodeEbcdic('GRP_TOK_4410_STMT')), // BNG
-      makeModcaField('D3A090', 4, makeTlePayload('ACCT_TOKEN', 'TOK-4410-DDA')), // TLE
-      makeModcaField('D3A090', 5, makeTlePayload('CYCLE_DATE', '2026-11-19')), // TLE
-      makeModcaField('D3A090', 6, makeTlePayload('MAIL_TRAY', candidateVariant ? 'TRAY_02' : 'TRAY_01')), // TLE drift
-      makeModcaField('D3A8AF', 7, encodeEbcdic('PAGE_0001')), // BPG
-      makeModcaField('D3A8C9', 8), // BAG
-      makeModcaField('D3A6AF', 9, makePgdPayload(2040, 2640, 240)), // PGD 8.5x11in @ 240dpi
-      makeModcaField('D3AB8A', 10, encodeEbcdic('C0H200B0_HELV10')), // MCF
-      makeModcaField('D3ABD8', 11, encodeEbcdic('O1BANKLG_LOGO')), // MPO
-      makeModcaField('D3A9C9', 12), // EAG
-      makeModcaField('D3A8DF', 13), // BPT
+      ...makeIocaLogoFields(2), // BRG/BPS Page Segment with real 1-bit IOCA BIM/IDD/IPD logo
+      makeModcaField('D3ABCC', 10, encodeEbcdic(candidateVariant ? 'SIMPLEX1' : 'DUPLEX01')), // IMM (Duplex vs Simplex drift!)
+      makeModcaField('D3A8AD', 11, encodeEbcdic('GRP_TOK_4410_STMT')), // BNG
+      makeModcaField('D3A090', 12, makeTlePayload('ACCT_TOKEN', 'TOK-4410-DDA')), // TLE
+      makeModcaField('D3A090', 13, makeTlePayload('CYCLE_DATE', '2026-11-19')), // TLE
+      makeModcaField('D3A090', 14, makeTlePayload('MAIL_TRAY', candidateVariant ? 'TRAY_02' : 'TRAY_01')), // TLE drift
+      makeModcaField('D3A8AF', 15, encodeEbcdic('PAGE_0001')), // BPG
+      makeModcaField('D3A8C9', 16), // BAG
+      makeModcaField('D3A6AF', 17, makePgdPayload(2040, 2640, 240)), // PGD 8.5x11in @ 240dpi
+      makeModcaField('D3AB8A', 18, encodeEbcdic('C0H200B0_HELV10')), // MCF
+      makeModcaField('D3ABD8', 19, encodeEbcdic('O1BANKLG_LOGO')), // MPO
+      makeModcaField('D3A9C9', 20), // EAG
+      makeModcaField('D3AF5F', 21, makeIpsPayload('SEG_BANK', 180, 110)), // IPS Page Segment Logo Placement
+      makeModcaField('D3A8DF', 22), // BPT
       makeModcaField(
         'D3EE9B',
-        14,
+        23,
         makePtocaPayload([
-          { x: 180, y: 240, fontId: 1, text: 'MERIDIAN SYNTHETIC DDA STATEMENT' },
-          { x: 180, y: 310, fontId: 1, text: 'ACCOUNT TOKEN: ****-****-4410   CYCLE: 2026-11-19' },
-          { x: 180, y: 400, fontId: 2, text: 'OPENING LEDGER BALANCE: $14,200.00' },
+          { x: 310, y: 155, fontId: 2, text: 'MERIDIAN SYNTHETIC DDA STATEMENT' },
+          { x: 180, y: 260, fontId: 1, text: 'ACCOUNT TOKEN: ****-****-4410   CYCLE: 2026-11-19' },
+          { x: 180, y: 310, fontId: 1, text: 'OPENING LEDGER BALANCE: $14,200.00' },
           {
             x: 180,
-            y: candidateVariant ? 512 : 470, // Y-coordinate drift in DDGS!
+            y: candidateVariant ? 512 : 430, // Y-coordinate drift in DDGS (>36 L-units)!
             fontId: candidateVariant ? 3 : 2, // Coded font ID drift in DDGS!
             text: 'CLOSING LEDGER BALANCE: $18,450.00   FORM DDA-500',
           },
+          // Multi-TRN fragments on exact same baseline Y=580 (must coalesce cleanly into 1 visual line)
+          { x: 180, y: 580, fontId: 1, text: 'REMITTANCE NOTICE: ' },
+          { x: 540, y: 580, fontId: 1, text: 'Electronic statements remain active at no fee.' },
+          // Rotated 270deg left-margin Code-39 mailroom barcode (must NOT be redaction-mangled)
+          { x: 95, y: 1750, fontId: 4, stoOrientation: 0x8700, text: '*030101100001*' },
         ])
       ), // PTX
-      makeModcaField('D3A9DF', 15), // EPT
-      makeModcaField('D3A8EB', 16, encodeEbcdic('IMB_MAIL_BARCODE_01')), // BBC
-      makeModcaField('D3A9EB', 17), // EBC
-      makeModcaField('D3A9AF', 18), // EPG
-      makeModcaField('D3A9AD', 19), // ENG
-      makeModcaField('D3A9A8', 20), // EDT
+      makeModcaField('D3A9DF', 24), // EPT
+      makeModcaField('D3A8EB', 25, encodeEbcdic('IMB_MAIL_BARCODE_01')), // BBC
+      makeModcaField('D3A9EB', 26), // EBC
+      makeModcaField('D3A9AF', 27), // EPG
+      makeModcaField('D3A9AD', 28), // ENG
+      makeModcaField('D3A9A8', 29), // EDT
     ];
     return Buffer.concat(seqFields);
   };
@@ -846,6 +956,26 @@ export async function initializeSyntheticStore(): Promise<Map<string, StoredRunR
       store.set(res.run.id, res);
     }
   }
+
+  // 11. Complex 2-Page CIBC AFP Form (Overlay BMO/IPO + GOCA Borders/Emblems + 4-Col Table + CCITT G4 / 24-bit RGB / 8-bit Grayscale Images + BCOCA & Rotated Barcodes)
+  const complexAfpSrcPath = path.join(cibcDir, 'IMDS_CIBC_COMPLEX_FORM_2P.afp');
+  const complexAfpDstPath = path.join(cibcDir, 'DDGS_CIBC_COMPLEX_FORM_2P.afp');
+  const complexAfpPair =
+    fs.existsSync(complexAfpSrcPath) && fs.existsSync(complexAfpDstPath)
+      ? { baseline: fs.readFileSync(complexAfpSrcPath), candidate: fs.readFileSync(complexAfpDstPath) }
+      : createComplexAfpFormPair();
+  const r11 = await runComparisonEngine({
+    runId: 'RUN-2026-1111',
+    config: INVENTORY_CONFIGS[3],
+    format: 'AFP',
+    baselineBuffer: complexAfpPair.baseline,
+    baselineFilename: 'IMDS_CIBC_COMPLEX_FORM_2P.afp',
+    candidateBuffer: complexAfpPair.candidate,
+    candidateFilename: 'DDGS_CIBC_COMPLEX_FORM_2P.afp',
+    papyrusExportAttached: false,
+    papyrusToolVersion: 'ISIS Papyrus Viewer (Awaiting QE Sign-Off)',
+  });
+  store.set(r11.run.id, r11);
 
   return store;
 }

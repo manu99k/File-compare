@@ -25,6 +25,7 @@ This folder contains **real publicly available CIBC banking forms and legal disc
 | **PDF (4p vs 4p)** | `IMDS_CIBC_USA_SMART_4P_SRC.pdf` | `DDGS_CIBC_USA_SMART_4P_DST_DEFECT.pdf` | Real CIBC Bank USA Smart Account Disclosures (`910126SAA`) with wire fee & alignment overlay variance |
 | **PDF (1p vs 1p)** | `IMDS_CIBC_MELLON_DD_SRC.pdf` | `DDGS_CIBC_MELLON_DD_DST_DEFECT.pdf` | Real CIBC Mellon Direct Deposit Request Form with institution/transit variance |
 | **AFP (MO:DCA)** | `IMDS_CIBC_DDA_STMT.afp` | `DDGS_CIBC_DDA_STMT.afp` | Native EBCDIC `0x5A` MO:DCA binary: CIBC Transit `00012` / Inst `010`, `IMM` `DUPLEX01 -> SIMPLEX1`, `TLE` tray drift, `PTOCA` Y & `SCFL` drift |
+| **AFP Complex Form (2p)** | `IMDS_CIBC_COMPLEX_FORM_2P.afp` | `DDGS_CIBC_COMPLEX_FORM_2P.afp` | Built-in `RUN-2026-1111`: `BMO`/`IPO` overlay form labels + graphics, GOCA borders/boxes/emblems, 4-column `DIR`/`DBR` table grid, `SEC` RGB colors, checkboxes, CCITT G4 logo, 24-bit RGB stamp variation, 8-bit grayscale signature, BCOCA + rotated `270°` barcodes, and Page 2 missing border rule variance |
 | **PCL5** | `IMDS_CIBC_MTG_ESCROW.pcl` | `DDGS_CIBC_MTG_ESCROW.pcl` | CIBC Mortgage & Escrow Notice: Tray `1 -> 4`, CPI `10 -> 12`, Font `12pt -> 10pt`, `$50` amount + X-shift, missing CDIC disclosure |
 | **RT / RPT** | `IMDS_CIBC_DAILY_RECON.rpt` | `DDGS_CIBC_DAILY_RECON.rpt` | CIBC Daily Clearing & Reconciliation: column spacing shift, amount change, omitted row `003`, record/total mismatch, and `CRLF -> LF` drift |
 
